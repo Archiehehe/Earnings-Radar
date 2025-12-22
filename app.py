@@ -1,612 +1,683 @@
-import math
+import os
 import time
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, date
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-import yfinance as yf
 
-from curl_cffi import requests as c_requests
+try:
+    import finnhub
+except Exception as e:
+    finnhub = None
 
 
 # -----------------------------
-# Page
+# App config
 # -----------------------------
-st.set_page_config(page_title="Earnings Radar", page_icon="📡", layout="wide")
-st.title("📡 Earnings Radar")
-st.caption(
-    "Upload a portfolio and get: next earnings dates + 52W context, and last 4 earnings events with "
-    "EPS (est vs actual), surprise, and 1D/5D price reaction. "
-    "Note: ETFs typically have no earnings."
+st.set_page_config(
+    page_title="Earnings Radar (Portfolio)",
+    page_icon="📅",
+    layout="wide",
 )
 
+st.title("📅 Earnings Radar — Portfolio Upload")
+st.caption(
+    "Upload a portfolio (CSV/Excel) and get next earnings dates + past 4 earnings with simple price-reaction context. "
+    "Powered by Finnhub (free API key required)."
+)
 
 # -----------------------------
 # Helpers
 # -----------------------------
-def _normalize_ticker(t: str) -> str:
-    return str(t).upper().strip().replace(".", "-")
+def get_api_key() -> Optional[str]:
+    # Streamlit Cloud: put this into Secrets as FINNHUB_API_KEY
+    # Locally: export FINNHUB_API_KEY=...
+    key = None
+    if "FINNHUB_API_KEY" in st.secrets:
+        key = st.secrets["FINNHUB_API_KEY"]
+    if not key:
+        key = os.getenv("FINNHUB_API_KEY")
+    return key
 
 
-def _safe_float(x: Any) -> Optional[float]:
+def get_client() -> "finnhub.Client":
+    if finnhub is None:
+        raise RuntimeError("finnhub-python is not installed. Check requirements.txt.")
+    key = get_api_key()
+    if not key:
+        raise RuntimeError("Missing FINNHUB_API_KEY. Add it in Streamlit Secrets or as an env var.")
+    return finnhub.Client(api_key=key)
+
+
+def symbol_variants(sym: str) -> List[str]:
+    """
+    Finnhub often accepts dot tickers (BRK.B). Some users upload dash tickers (BRK-B).
+    Try both.
+    """
+    s = (sym or "").strip().upper()
+    if not s:
+        return []
+    vars_ = [s]
+    if "." in s:
+        vars_.append(s.replace(".", "-"))
+    if "-" in s:
+        vars_.append(s.replace("-", "."))
+    # de-dup while keeping order
+    out = []
+    for v in vars_:
+        if v not in out:
+            out.append(v)
+    return out
+
+
+def safe_float(x) -> Optional[float]:
     try:
         if x is None:
             return None
+        if isinstance(x, (float, int, np.floating, np.integer)):
+            if np.isnan(x):
+                return None
+            return float(x)
+        if isinstance(x, str) and x.strip() == "":
+            return None
         v = float(x)
-        if math.isnan(v):
+        if np.isnan(v):
             return None
         return v
     except Exception:
         return None
 
 
-def _fmt_num(x: Any, d: int = 2) -> str:
-    v = _safe_float(x)
-    return "—" if v is None else f"{v:,.{d}f}"
+def to_percent(x: Optional[float]) -> Optional[float]:
+    if x is None:
+        return None
+    return 100.0 * x
 
 
-def _fmt_pct(x: Any, d: int = 1) -> str:
-    v = _safe_float(x)
-    return "—" if v is None else f"{v:+.{d}f}%"
+def fmt_pct(x: Optional[float]) -> str:
+    if x is None or np.isnan(x):
+        return "—"
+    return f"{x:.1f}%"
 
 
-def chunk_list(xs: List[str], n: int) -> List[List[str]]:
-    return [xs[i : i + n] for i in range(0, len(xs), n)]
+def fmt_num(x: Optional[float]) -> str:
+    if x is None or np.isnan(x):
+        return "—"
+    return f"{x:,.2f}"
 
 
-def today_utc_date() -> pd.Timestamp:
-    return pd.Timestamp(datetime.now(timezone.utc)).normalize()
-
-
-def read_portfolio_file(uploaded) -> pd.DataFrame:
-    name = (uploaded.name or "").lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(uploaded)
-    if name.endswith(".xlsx") or name.endswith(".xls"):
-        return pd.read_excel(uploaded)
-    raise ValueError("Unsupported file type. Upload .csv, .xlsx, or .xls")
-
-
-def find_ticker_column(df: pd.DataFrame) -> Optional[str]:
-    candidates = ["Ticker", "Symbol", "Ticker Symbol", "Trading Symbol", "Security", "Instrument"]
-    cols = list(df.columns)
-
-    for c in candidates:
-        if c in cols:
-            return c
-
-    lower_map = {str(c).strip().lower(): c for c in cols}
-    for c in candidates:
-        key = str(c).strip().lower()
-        if key in lower_map:
-            return lower_map[key]
-
-    return None
+def fmt_date(x) -> str:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "—"
+    if isinstance(x, (datetime, pd.Timestamp)):
+        return x.strftime("%Y-%m-%d")
+    if isinstance(x, date):
+        return x.strftime("%Y-%m-%d")
+    return str(x)
 
 
 # -----------------------------
-# Yahoo quoteSummary (hardened)
+# Rate limit (gentle throttle)
 # -----------------------------
-@st.cache_resource
-def yahoo_session() -> c_requests.Session:
+def throttle(min_interval_s: float = 0.15) -> None:
     """
-    Persistent session with a warm-up request to set Yahoo cookies.
-    This improves reliability on Streamlit Cloud.
+    Finnhub free tier is commonly ~60 calls/min. We'll keep a gentle delay.
+    Caching reduces calls a lot.
     """
-    sess = c_requests.Session(impersonate="chrome")
-    try:
-        # Warm cookies / consent flow (best-effort)
-        sess.get(
-            "https://finance.yahoo.com/",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=15,
-        )
-    except Exception:
-        pass
-    return sess
+    last = st.session_state.get("_fh_last_call_ts", 0.0)
+    now = time.time()
+    wait = min_interval_s - (now - last)
+    if wait > 0:
+        time.sleep(wait)
+    st.session_state["_fh_last_call_ts"] = time.time()
 
 
-def _qs_request(url: str, params: Dict[str, str]) -> Dict[str, Any]:
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json,text/plain,*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://finance.yahoo.com/",
-        "Connection": "keep-alive",
-    }
-
-    # retry a couple times (Yahoo sometimes returns transient empties)
-    for attempt in range(3):
+# -----------------------------
+# Finnhub API wrappers (cached)
+# -----------------------------
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def fh_profile2(symbol: str) -> Tuple[Optional[dict], Optional[str]]:
+    """
+    Returns (profile, used_symbol)
+    """
+    c = get_client()
+    for sym in symbol_variants(symbol):
         try:
-            r = yahoo_session().get(url, params=params, headers=headers, timeout=20)
-            if r.status_code != 200:
-                time.sleep(0.4 * (attempt + 1))
-                continue
-
-            j = r.json()
-            res = j.get("quoteSummary", {}).get("result")
-            if res and isinstance(res, list) and res[0]:
-                return res[0]
-            time.sleep(0.4 * (attempt + 1))
+            throttle()
+            prof = c.company_profile2(symbol=sym)
+            if isinstance(prof, dict) and (prof.get("name") or prof.get("ticker") or prof.get("finnhubIndustry")):
+                return prof, sym
         except Exception:
-            time.sleep(0.4 * (attempt + 1))
+            continue
+    return None, None
 
-    return {}
 
-
-@st.cache_data(show_spinner=False, ttl=6 * 3600)
-def quote_summary(ticker: str, modules: List[str]) -> Dict[str, Any]:
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def fh_company_earnings(symbol: str, limit: int = 4) -> Tuple[List[dict], Optional[str]]:
     """
-    Uses query1 + query2 fallback. Returns quoteSummary result dict or {}.
+    Past earnings surprises (usually quarterly). Returns (list, used_symbol).
     """
-    tk = _normalize_ticker(ticker)
-    params = {"modules": ",".join(modules)}
-
-    url1 = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{tk}"
-    url2 = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{tk}"
-
-    out = _qs_request(url1, params)
-    if out:
-        return out
-
-    out = _qs_request(url2, params)
-    return out or {}
-
-
-def _quote_type(summary: Dict[str, Any]) -> Optional[str]:
-    try:
-        qt = (summary.get("quoteType") or {}).get("quoteType")
-        if isinstance(qt, str):
-            return qt.upper()
-    except Exception:
-        pass
-    return None
-
-
-def _is_fund_like(summary: Dict[str, Any]) -> bool:
-    qt = _quote_type(summary)
-    return qt in {"ETF", "MUTUALFUND", "FUND", "INDEX"}
-
-
-# -----------------------------
-# Earnings: Next + Past
-# -----------------------------
-@st.cache_data(show_spinner=False, ttl=6 * 3600)
-def next_earnings_date(ticker: str) -> Tuple[Optional[pd.Timestamp], str]:
-    """
-    Returns (next_earnings_ts_utc, reason)
-    """
-    tk = _normalize_ticker(ticker)
-
-    # 1) Yahoo quoteSummary calendarEvents (best)
-    s = quote_summary(tk, modules=["calendarEvents", "quoteType"])
-    if s:
-        if _is_fund_like(s):
-            return None, "ETF/Fund (no earnings)"
+    c = get_client()
+    for sym in symbol_variants(symbol):
         try:
-            earnings = (s.get("calendarEvents") or {}).get("earnings") or {}
-            dates = earnings.get("earningsDate") or []
-            now = today_utc_date()
-            candidates = []
-            for d in dates:
-                raw = d.get("raw") if isinstance(d, dict) else None
-                if raw is None:
-                    continue
-                ts = pd.to_datetime(int(raw), unit="s", utc=True, errors="coerce")
-                if pd.notna(ts) and ts.normalize() >= now:
-                    candidates.append(ts)
-            if candidates:
-                return pd.Timestamp(min(candidates)), "Yahoo calendarEvents"
+            throttle()
+            rows = c.company_earnings(sym, limit=limit)
+            if isinstance(rows, list) and len(rows) > 0:
+                return rows, sym
+            # if it's a valid response but empty, still accept symbol
+            if isinstance(rows, list):
+                return [], sym
         except Exception:
-            pass
-
-    # 2) yfinance fallback (sometimes works when Yahoo blocks quoteSummary)
-    try:
-        t = yf.Ticker(tk)
-        cal = t.calendar
-        # calendar can be dict-like or df-like depending on yfinance version
-        if isinstance(cal, pd.DataFrame) and not cal.empty:
-            # common layout: a single column with index labels
-            # try to find "Earnings Date"
-            idx = [str(i).lower() for i in cal.index]
-            if any("earnings date" in i for i in idx):
-                row = cal.loc[[cal.index[idx.index(next(i for i in idx if "earnings date" in i))]]]
-                # may contain list / Timestamp
-                val = row.iloc[0, 0]
-                if isinstance(val, (list, tuple)) and len(val) > 0:
-                    dt = pd.to_datetime(val[0], utc=True, errors="coerce")
-                else:
-                    dt = pd.to_datetime(val, utc=True, errors="coerce")
-                if pd.notna(dt):
-                    return pd.Timestamp(dt), "yfinance calendar"
-        elif isinstance(cal, dict):
-            # sometimes "Earnings Date" key exists
-            for k in cal.keys():
-                if "earn" in str(k).lower():
-                    dt = pd.to_datetime(cal[k], utc=True, errors="coerce")
-                    if pd.notna(dt):
-                        return pd.Timestamp(dt), "yfinance calendar"
-    except Exception:
-        pass
-
-    return None, "No next earnings from Yahoo/yfinance"
+            continue
+    return [], None
 
 
-@st.cache_data(show_spinner=False, ttl=12 * 3600)
-def past_earnings_events(ticker: str, limit: int = 12) -> Tuple[pd.DataFrame, str]:
+@st.cache_data(ttl=2 * 60 * 60, show_spinner=False)
+def fh_earnings_calendar_next(symbol: str, lookahead_days: int = 180) -> Tuple[Optional[pd.Timestamp], Optional[str]]:
     """
-    Returns (df, reason). df columns:
-      Earnings Date (UTC), EPS Estimate, Reported EPS, Surprise(%)
+    Try to get the next upcoming earnings date from the earnings calendar.
     """
-    tk = _normalize_ticker(ticker)
+    c = get_client()
+    start = date.today()
+    end = start + timedelta(days=int(lookahead_days))
 
-    # 1) Yahoo quoteSummary earningsHistory (preferred)
-    s = quote_summary(tk, modules=["earningsHistory", "quoteType"])
-    if s:
-        if _is_fund_like(s):
-            return pd.DataFrame(), "ETF/Fund (no earnings)"
+    for sym in symbol_variants(symbol):
         try:
-            eh = s.get("earningsHistory") or {}
-            hist = eh.get("history") or []
-            rows = []
-            for item in hist[: max(1, limit)]:
-                quarter_raw = (item.get("quarter") or {}).get("raw")
-                if quarter_raw is None:
-                    continue
-                ts = pd.to_datetime(int(quarter_raw), unit="s", utc=True, errors="coerce")
-                if pd.isna(ts):
-                    continue
-
-                eps_est = (item.get("epsEstimate") or {}).get("raw")
-                eps_act = (item.get("epsActual") or {}).get("raw")
-                surprise = (item.get("surprisePercent") or {}).get("raw")
-
-                rows.append(
-                    {
-                        "Earnings Date (UTC)": pd.Timestamp(ts),
-                        "EPS Estimate": _safe_float(eps_est),
-                        "Reported EPS": _safe_float(eps_act),
-                        "Surprise(%)": (_safe_float(surprise) * 100.0) if _safe_float(surprise) is not None else None,
-                    }
-                )
-            if rows:
-                df = pd.DataFrame(rows).sort_values("Earnings Date (UTC)")
-                return df, "Yahoo earningsHistory"
+            throttle()
+            cal = c.earnings_calendar(_from=start.strftime("%Y-%m-%d"), to=end.strftime("%Y-%m-%d"), symbol=sym, international=False)
+            # Finnhub response style: {'earningsCalendar': [...]}
+            events = None
+            if isinstance(cal, dict):
+                events = cal.get("earningsCalendar")
+            if isinstance(events, list) and events:
+                # pick the earliest event date
+                ds = []
+                for ev in events:
+                    d = ev.get("date") or ev.get("datetime") or ev.get("epsReportDate")
+                    if d:
+                        try:
+                            ds.append(pd.to_datetime(d).normalize())
+                        except Exception:
+                            pass
+                if ds:
+                    return min(ds), sym
+            # valid but empty is still ok
+            if isinstance(events, list):
+                return None, sym
         except Exception:
-            pass
-
-    # 2) yfinance fallback: get_earnings_dates (can be flaky but helps some tickers)
-    try:
-        t = yf.Ticker(tk)
-        df = t.get_earnings_dates(limit=limit)
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            out = df.copy()
-            # Ensure a standard schema
-            # yfinance typically uses index as DatetimeIndex
-            if not isinstance(out.index, pd.DatetimeIndex):
-                # try common columns
-                for c in out.columns:
-                    if "earn" in str(c).lower() and "date" in str(c).lower():
-                        out.index = pd.to_datetime(out[c], utc=True, errors="coerce")
-                        break
-
-            out = out[~out.index.isna()].sort_index()
-            out = out.reset_index().rename(columns={"index": "Earnings Date (UTC)"})
-            out["Earnings Date (UTC)]"] = out["Earnings Date (UTC)"]
-
-            # normalize column names
-            col_map = {}
-            for c in out.columns:
-                lc = str(c).lower()
-                if "eps estimate" in lc:
-                    col_map[c] = "EPS Estimate"
-                if "reported eps" in lc or (lc == "epsactual"):
-                    col_map[c] = "Reported EPS"
-                if "surprise" in lc and "%" in lc:
-                    col_map[c] = "Surprise(%)"
-                if "earnings date" in lc:
-                    col_map[c] = "Earnings Date (UTC)"
-            out = out.rename(columns=col_map)
-
-            keep = ["Earnings Date (UTC)", "EPS Estimate", "Reported EPS", "Surprise(%)"]
-            keep = [c for c in keep if c in out.columns]
-            out = out[keep].copy()
-
-            # index may already be UTC; force UTC
-            out["Earnings Date (UTC)"] = pd.to_datetime(out["Earnings Date (UTC)"], utc=True, errors="coerce")
-            out = out.dropna(subset=["Earnings Date (UTC)"]).sort_values("Earnings Date (UTC)")
-            if not out.empty:
-                return out, "yfinance get_earnings_dates"
-    except Exception:
-        pass
-
-    return pd.DataFrame(), "No earnings history from Yahoo/yfinance"
-
-
-# -----------------------------
-# Prices + 52W context
-# -----------------------------
-@st.cache_data(show_spinner=False, ttl=6 * 3600)
-def fetch_1y_price_metrics(tickers: List[str]) -> pd.DataFrame:
-    if not tickers:
-        return pd.DataFrame()
-
-    results = []
-    for batch in chunk_list(tickers, 120):
-        try:
-            data = yf.download(
-                tickers=batch,
-                period="1y",
-                interval="1d",
-                group_by="ticker",
-                auto_adjust=False,
-                threads=True,
-                progress=False,
-            )
-        except Exception:
-            data = pd.DataFrame()
-
-        if data is None or data.empty:
-            for tk in batch:
-                results.append({"Ticker": tk})
             continue
 
-        if isinstance(data.columns, pd.MultiIndex):
-            for tk in batch:
-                if tk not in data.columns.get_level_values(0):
-                    results.append({"Ticker": tk})
-                    continue
-                closes = data[(tk, "Close")].dropna()
-                highs = data[(tk, "High")].dropna()
-                lows = data[(tk, "Low")].dropna()
+    return None, None
 
-                cur = _safe_float(closes.iloc[-1]) if not closes.empty else None
-                hi = _safe_float(highs.max()) if not highs.empty else None
-                lo = _safe_float(lows.min()) if not lows.empty else None
 
-                d_hi = (cur - hi) / hi * 100.0 if (cur is not None and hi not in (None, 0)) else None
-                d_lo = (cur - lo) / lo * 100.0 if (cur is not None and lo not in (None, 0)) else None
-                rng = (hi - lo) / lo * 100.0 if (hi is not None and lo not in (None, 0)) else None
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def fh_daily_candles(symbol: str, years: int = 2) -> Tuple[pd.DataFrame, Optional[str]]:
+    """
+    Fetch daily candles for last N years and return a DF indexed by date.
+    Used for current price, 52W highs/lows, and event reaction.
+    """
+    c = get_client()
+    to_ts = int(time.time())
+    from_ts = int((datetime.utcnow() - timedelta(days=365 * years)).timestamp())
 
-                results.append(
-                    {
-                        "Ticker": tk,
-                        "Current": cur,
-                        "52W High": hi,
-                        "52W Low": lo,
-                        "Δ vs 52W High (%)": d_hi,
-                        "Δ vs 52W Low (%)": d_lo,
-                        "52W Range (%)": rng,
-                    }
-                )
-        else:
-            tk = batch[0]
-            closes = data["Close"].dropna()
-            highs = data["High"].dropna()
-            lows = data["Low"].dropna()
+    for sym in symbol_variants(symbol):
+        try:
+            throttle()
+            res = c.stock_candles(sym, "D", from_ts, to_ts)
+            # Typical: {'c':[], 'h':[], 'l':[], 'o':[], 's':'ok', 't':[], 'v':[]}
+            if not isinstance(res, dict) or res.get("s") != "ok":
+                continue
+            ts = res.get("t") or []
+            if not ts:
+                continue
 
-            cur = _safe_float(closes.iloc[-1]) if not closes.empty else None
-            hi = _safe_float(highs.max()) if not highs.empty else None
-            lo = _safe_float(lows.min()) if not lows.empty else None
-
-            d_hi = (cur - hi) / hi * 100.0 if (cur is not None and hi not in (None, 0)) else None
-            d_lo = (cur - lo) / lo * 100.0 if (cur is not None and lo not in (None, 0)) else None
-            rng = (hi - lo) / lo * 100.0 if (hi is not None and lo not in (None, 0)) else None
-
-            results.append(
+            df = pd.DataFrame(
                 {
-                    "Ticker": tk,
-                    "Current": cur,
-                    "52W High": hi,
-                    "52W Low": lo,
-                    "Δ vs 52W High (%)": d_hi,
-                    "Δ vs 52W Low (%)": d_lo,
-                    "52W Range (%)": rng,
+                    "date": pd.to_datetime(ts, unit="s", utc=True).tz_convert(None).normalize(),
+                    "open": res.get("o", []),
+                    "high": res.get("h", []),
+                    "low": res.get("l", []),
+                    "close": res.get("c", []),
+                    "volume": res.get("v", []),
+                }
+            ).dropna(subset=["date", "close"])
+
+            df = df.sort_values("date").drop_duplicates("date").set_index("date")
+            return df, sym
+        except Exception:
+            continue
+
+    return pd.DataFrame(columns=["open", "high", "low", "close", "volume"]), None
+
+
+# -----------------------------
+# Analytics
+# -----------------------------
+def compute_52w_metrics(candles: pd.DataFrame) -> Dict[str, Optional[float]]:
+    if candles is None or candles.empty or "close" not in candles.columns:
+        return {"current": None, "high_52w": None, "low_52w": None, "vs_52w_high": None, "vs_52w_low": None, "range_52w": None}
+
+    closes = candles["close"].dropna()
+    if closes.empty:
+        return {"current": None, "high_52w": None, "low_52w": None, "vs_52w_high": None, "vs_52w_low": None, "range_52w": None}
+
+    # Use last 252 trading days for "52W"
+    last_52w = closes.tail(252)
+    current = float(closes.iloc[-1])
+    high_52w = float(last_52w.max()) if not last_52w.empty else None
+    low_52w = float(last_52w.min()) if not last_52w.empty else None
+
+    vs_high = None
+    vs_low = None
+    rng = None
+    if high_52w and high_52w != 0:
+        vs_high = (current - high_52w) / high_52w
+    if low_52w and low_52w != 0:
+        vs_low = (current - low_52w) / low_52w
+        if high_52w is not None:
+            rng = (high_52w - low_52w) / low_52w
+
+    return {
+        "current": current,
+        "high_52w": high_52w,
+        "low_52w": low_52w,
+        "vs_52w_high": to_percent(vs_high),
+        "vs_52w_low": to_percent(vs_low),
+        "range_52w": to_percent(rng),
+    }
+
+
+def price_reaction_from_candles(candles: pd.DataFrame, event_date: pd.Timestamp) -> Dict[str, Optional[float]]:
+    """
+    Compute simple post-earnings reaction using daily closes:
+      pre_close = last close strictly BEFORE event_date
+      post_close_1d = first close strictly AFTER event_date
+      post_close_3d = close 3 trading days AFTER event_date
+
+    This approximates "after-hours earnings → next trading day reaction" pretty well.
+    """
+    out = {
+        "pre_date": None,
+        "pre_close": None,
+        "post1_date": None,
+        "post1_close": None,
+        "ret_1d": None,
+        "post3_date": None,
+        "post3_close": None,
+        "ret_3d": None,
+    }
+    if candles is None or candles.empty:
+        return out
+
+    idx = candles.index
+    if not isinstance(event_date, pd.Timestamp):
+        try:
+            event_date = pd.to_datetime(event_date).normalize()
+        except Exception:
+            return out
+    else:
+        event_date = event_date.normalize()
+
+    # pre: last date < event_date
+    pre_mask = idx < event_date
+    if not pre_mask.any():
+        return out
+    pre_date = idx[pre_mask][-1]
+    pre_close = safe_float(candles.loc[pre_date, "close"])
+
+    # post1: first date > event_date
+    post_mask = idx > event_date
+    if not post_mask.any():
+        out.update({"pre_date": pre_date, "pre_close": pre_close})
+        return out
+
+    post_dates = idx[post_mask]
+    post1_date = post_dates[0]
+    post1_close = safe_float(candles.loc[post1_date, "close"])
+
+    ret_1d = None
+    if pre_close and post1_close:
+        ret_1d = (post1_close - pre_close) / pre_close
+
+    # post3: 3 trading days after event_date (3rd element)
+    post3_date = None
+    post3_close = None
+    ret_3d = None
+    if len(post_dates) >= 3:
+        post3_date = post_dates[2]
+        post3_close = safe_float(candles.loc[post3_date, "close"])
+        if pre_close and post3_close:
+            ret_3d = (post3_close - pre_close) / pre_close
+
+    out.update(
+        {
+            "pre_date": pre_date,
+            "pre_close": pre_close,
+            "post1_date": post1_date,
+            "post1_close": post1_close,
+            "ret_1d": to_percent(ret_1d),
+            "post3_date": post3_date,
+            "post3_close": post3_close,
+            "ret_3d": to_percent(ret_3d),
+        }
+    )
+    return out
+
+
+# -----------------------------
+# Portfolio parsing
+# -----------------------------
+def load_portfolio(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
+    elif name.endswith(".xlsx") or name.endswith(".xls"):
+        df = pd.read_excel(uploaded_file)
+    else:
+        raise ValueError("Unsupported file type. Upload CSV or Excel.")
+    # Normalize columns
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def extract_tickers(df: pd.DataFrame) -> List[str]:
+    if df is None or df.empty:
+        return []
+    cols = [c.lower() for c in df.columns]
+    ticker_col = None
+    for candidate in ["ticker", "symbol", "symbols", "tickers"]:
+        if candidate in cols:
+            ticker_col = df.columns[cols.index(candidate)]
+            break
+    if ticker_col is None:
+        # fallback: first column
+        ticker_col = df.columns[0]
+
+    tickers = (
+        df[ticker_col]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .replace({"": np.nan, "NAN": np.nan, "NONE": np.nan})
+        .dropna()
+        .tolist()
+    )
+
+    # de-dup order-preserving
+    out = []
+    for t in tickers:
+        t = t.strip().upper()
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+# -----------------------------
+# UI: Upload first (very visible)
+# -----------------------------
+st.subheader("1) Upload your portfolio (CSV or Excel)")
+uploaded = st.file_uploader(
+    "Upload a portfolio file with a column named Ticker or Symbol (or put tickers in the first column).",
+    type=["csv", "xlsx", "xls"],
+    help="Examples: Ticker, Symbol. Other columns are ignored for this app.",
+)
+
+manual_tickers = []
+portfolio_df = None
+tickers = []
+
+colA, colB = st.columns([1, 1])
+with colA:
+    st.markdown("**No file?** Paste tickers (comma-separated):")
+    raw = st.text_input("Tickers", value="", placeholder="AAPL, MSFT, NVDA")
+    if raw.strip():
+        manual_tickers = [t.strip().upper() for t in raw.split(",") if t.strip()]
+
+with colB:
+    st.info(
+        "🔑 **You must set a Finnhub API key** in Streamlit Secrets:\n\n"
+        "`FINNHUB_API_KEY = \"your_key\"`\n\n"
+        "Finnhub’s earnings calendar + earnings history are much more reliable than Yahoo."
+    )
+
+if uploaded is not None:
+    try:
+        portfolio_df = load_portfolio(uploaded)
+        tickers = extract_tickers(portfolio_df)
+        st.success(f"Loaded {len(tickers)} unique tickers from file.")
+    except Exception as e:
+        st.error(f"Could not read portfolio: {e}")
+
+if not tickers and manual_tickers:
+    tickers = manual_tickers
+    st.success(f"Using {len(tickers)} tickers from manual input.")
+
+if not tickers:
+    st.stop()
+
+
+# -----------------------------
+# Sidebar controls
+# -----------------------------
+st.sidebar.header("Settings")
+lookahead_days = st.sidebar.slider("Next earnings lookahead (days)", 30, 365, 180, 15)
+max_holdings = st.sidebar.slider("Max tickers to process", 5, 200, min(60, len(tickers)), 5)
+show_only_upcoming = st.sidebar.checkbox("Show only holdings with an upcoming earnings date", value=False)
+upcoming_within_days = st.sidebar.slider("Upcoming earnings within (days)", 7, 365, 60, 7)
+
+st.sidebar.divider()
+st.sidebar.caption("Tip: If you upload 200 tickers, processing will take longer even with caching.")
+
+run = st.sidebar.button("🚀 Run Earnings Radar", use_container_width=True)
+
+if not run:
+    st.stop()
+
+
+# -----------------------------
+# Main processing
+# -----------------------------
+st.subheader("2) Portfolio Overview")
+
+tickers = tickers[:max_holdings]
+
+progress = st.progress(0, text="Starting…")
+rows = []
+errors = []
+
+for i, t in enumerate(tickers, start=1):
+    try:
+        prof, used_sym_prof = fh_profile2(t)
+        candles, used_sym_candles = fh_daily_candles(t, years=2)
+        next_dt, used_sym_next = fh_earnings_calendar_next(t, lookahead_days=lookahead_days)
+
+        name = None
+        sector = None
+        industry = None
+        if prof:
+            name = prof.get("name") or prof.get("ticker")
+            # Finnhub profile2 fields vary; best-effort:
+            sector = prof.get("gicsSector") or prof.get("sector")
+            industry = prof.get("finnhubIndustry") or prof.get("gicsIndustry") or prof.get("industry")
+
+        m = compute_52w_metrics(candles)
+
+        rows.append(
+            {
+                "Ticker": t,
+                "Company": name,
+                "Sector": sector,
+                "Industry": industry,
+                "Next Earnings": next_dt,
+                "Current": m["current"],
+                "Δ vs 52W High (%)": m["vs_52w_high"],
+                "Δ vs 52W Low (%)": m["vs_52w_low"],
+                "52W Range (%)": m["range_52w"],
+                "_sym_used_profile": used_sym_prof,
+                "_sym_used_candles": used_sym_candles,
+                "_sym_used_next": used_sym_next,
+            }
+        )
+    except Exception as e:
+        errors.append((t, str(e)))
+
+    progress.progress(i / len(tickers), text=f"Processing {i}/{len(tickers)}: {t}")
+
+progress.empty()
+
+overview = pd.DataFrame(rows)
+
+# Clean types
+if not overview.empty:
+    overview["Next Earnings"] = pd.to_datetime(overview["Next Earnings"], errors="coerce")
+    for c in ["Current", "Δ vs 52W High (%)", "Δ vs 52W Low (%)", "52W Range (%)"]:
+        overview[c] = pd.to_numeric(overview[c], errors="coerce")
+
+# Filters
+filtered = overview.copy()
+if show_only_upcoming:
+    filtered = filtered.dropna(subset=["Next Earnings"])
+if not filtered.empty:
+    cutoff = pd.Timestamp(date.today() + timedelta(days=int(upcoming_within_days)))
+    filtered["Days to Earnings"] = (filtered["Next Earnings"] - pd.Timestamp(date.today())).dt.days
+    filtered = filtered[(filtered["Next Earnings"].isna()) | (filtered["Next Earnings"] <= cutoff)]
+
+# Display
+display_df = filtered.copy()
+if "Days to Earnings" not in display_df.columns and "Next Earnings" in display_df.columns:
+    display_df["Days to Earnings"] = (display_df["Next Earnings"] - pd.Timestamp(date.today())).dt.days
+
+# Column order
+cols = [
+    "Ticker", "Company", "Sector", "Industry",
+    "Next Earnings", "Days to Earnings",
+    "Current", "Δ vs 52W High (%)", "Δ vs 52W Low (%)", "52W Range (%)",
+]
+cols = [c for c in cols if c in display_df.columns]
+
+st.dataframe(
+    display_df[cols].sort_values(["Next Earnings", "Ticker"], na_position="last"),
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "Next Earnings": st.column_config.DatetimeColumn(format="YYYY-MM-DD"),
+        "Days to Earnings": st.column_config.NumberColumn(format="%d"),
+        "Current": st.column_config.NumberColumn(format="%.2f"),
+        "Δ vs 52W High (%)": st.column_config.NumberColumn(format="%.1f"),
+        "Δ vs 52W Low (%)": st.column_config.NumberColumn(format="%.1f"),
+        "52W Range (%)": st.column_config.NumberColumn(format="%.1f"),
+    },
+)
+
+# Download
+csv_bytes = display_df[cols].to_csv(index=False).encode("utf-8")
+st.download_button(
+    "⬇️ Download Portfolio Overview (CSV)",
+    data=csv_bytes,
+    file_name="earnings_radar_overview.csv",
+    mime="text/csv",
+)
+
+if errors:
+    with st.expander("⚠️ Errors (some tickers may be ETFs/funds or have missing coverage)"):
+        for t, msg in errors[:200]:
+            st.write(f"**{t}** — {msg}")
+
+
+# -----------------------------
+# Past earnings + reaction
+# -----------------------------
+st.subheader("3) Past 4 Earnings + Price Reaction (per holding)")
+
+st.caption(
+    "This uses Finnhub company earnings history + your 2-year daily candles. "
+    "Reaction is measured from the last close **before** the earnings date to the 1st/3rd close **after** it."
+)
+
+if overview.empty:
+    st.info("No companies processed.")
+    st.stop()
+
+# Use the same tickers order
+for _, row in overview.iterrows():
+    t = row["Ticker"]
+    company = row.get("Company") or t
+
+    with st.expander(f"{t} — {company}", expanded=False):
+        earnings, used_sym_earn = fh_company_earnings(t, limit=4)
+        candles, used_sym_c = fh_daily_candles(t, years=2)
+
+        if not earnings:
+            st.info("No earnings history returned for this ticker (often ETFs/funds or incomplete coverage).")
+            continue
+
+        # Build earnings table with reactions
+        out_rows = []
+        for ev in earnings:
+            # Finnhub usually provides date like '2024-02-01'
+            ev_date_raw = ev.get("date") or ev.get("period")
+            try:
+                ev_date = pd.to_datetime(ev.get("date")).normalize()
+            except Exception:
+                ev_date = None
+
+            eps_a = safe_float(ev.get("epsActual"))
+            eps_e = safe_float(ev.get("epsEstimate"))
+            surprise = safe_float(ev.get("epsSurprise"))
+            surprise_pct = safe_float(ev.get("epsSurprisePercent"))
+
+            rx = {}
+            if ev_date is not None and not candles.empty:
+                rx = price_reaction_from_candles(candles, ev_date)
+            else:
+                rx = {}
+
+            out_rows.append(
+                {
+                    "Earnings Date": ev.get("date"),
+                    "Quarter": ev.get("period") or ev.get("quarter"),
+                    "EPS Actual": eps_a,
+                    "EPS Est.": eps_e,
+                    "Surprise": surprise,
+                    "Surprise %": surprise_pct,
+                    "Pre Close Date": rx.get("pre_date"),
+                    "Post Close (1D) Date": rx.get("post1_date"),
+                    "1D Reaction %": rx.get("ret_1d"),
+                    "Post Close (3D) Date": rx.get("post3_date"),
+                    "3D Reaction %": rx.get("ret_3d"),
                 }
             )
 
-    return pd.DataFrame(results).drop_duplicates(subset=["Ticker"])
+        evdf = pd.DataFrame(out_rows)
+        if not evdf.empty:
+            # format dates
+            for c in ["Pre Close Date", "Post Close (1D) Date", "Post Close (3D) Date"]:
+                evdf[c] = pd.to_datetime(evdf[c], errors="coerce")
+
+            st.dataframe(
+                evdf.sort_values("Earnings Date", ascending=False),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "EPS Actual": st.column_config.NumberColumn(format="%.2f"),
+                    "EPS Est.": st.column_config.NumberColumn(format="%.2f"),
+                    "Surprise": st.column_config.NumberColumn(format="%.2f"),
+                    "Surprise %": st.column_config.NumberColumn(format="%.1f"),
+                    "1D Reaction %": st.column_config.NumberColumn(format="%.1f"),
+                    "3D Reaction %": st.column_config.NumberColumn(format="%.1f"),
+                    "Pre Close Date": st.column_config.DatetimeColumn(format="YYYY-MM-DD"),
+                    "Post Close (1D) Date": st.column_config.DatetimeColumn(format="YYYY-MM-DD"),
+                    "Post Close (3D) Date": st.column_config.DatetimeColumn(format="YYYY-MM-DD"),
+                },
+            )
+        else:
+            st.info("No earnings rows to display.")
 
 
-@st.cache_data(show_spinner=False, ttl=12 * 3600)
-def fetch_price_history(ticker: str, period: str = "2y") -> pd.DataFrame:
-    try:
-        df = yf.download(
-            tickers=_normalize_ticker(ticker),
-            period=period,
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            threads=True,
-        )
-        if df is None or df.empty:
-            return pd.DataFrame()
-        df = df.copy()
-        df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
-        df = df[~df.index.isna()]
-        return df
-    except Exception:
-        return pd.DataFrame()
-
-
-def event_reaction_metrics(hist: pd.DataFrame, event_ts: pd.Timestamp) -> Dict[str, Any]:
-    """
-    Uses the last close on/before event date and computes 1D and 5D change after that.
-    """
-    if hist is None or hist.empty or "Close" not in hist.columns:
-        return {}
-
-    close = hist["Close"].dropna()
-    if close.empty:
-        return {}
-
-    event_day = pd.to_datetime(event_ts, utc=True, errors="coerce")
-    if pd.isna(event_day):
-        return {}
-    event_day = event_day.normalize()
-
-    idx_norm = close.index.normalize()
-    pos = np.where(idx_norm <= event_day)[0]
-    if len(pos) == 0:
-        return {}
-    p0 = int(pos[-1])
-
-    prev_close = _safe_float(close.iloc[p0])
-    next1 = _safe_float(close.iloc[p0 + 1]) if p0 + 1 < len(close) else None
-    next5 = _safe_float(close.iloc[p0 + 5]) if p0 + 5 < len(close) else None
-
-    move_1d = (next1 / prev_close - 1.0) * 100.0 if (prev_close not in (None, 0) and next1 is not None) else None
-    move_5d = (next5 / prev_close - 1.0) * 100.0 if (prev_close not in (None, 0) and next5 is not None) else None
-
-    return {
-        "Event Close (prev)": prev_close,
-        "1D Move (%)": move_1d,
-        "5D Move (%)": move_5d,
-    }
-
-
-# -----------------------------
-# UI: Upload is PRIMARY
-# -----------------------------
-st.subheader("📤 Upload Portfolio (Primary)")
-st.markdown("Upload a **CSV or Excel** file with a ticker column (like `Ticker` or `Symbol`).")
-
-portfolio_file = st.file_uploader("Portfolio file", type=["csv", "xlsx", "xls"])
-
-c1, c2, c3 = st.columns([1, 1, 1])
-with c1:
-    max_tickers = st.slider("Max tickers to process (speed)", 5, 200, 40, 5)
-with c2:
-    only_with_next = st.checkbox("Only tickers with next earnings", value=False)
-with c3:
-    show_source_cols = st.checkbox("Show data-source columns", value=True)
-
-with st.popover("ℹ️ Why is earnings sometimes missing?"):
-    st.markdown(
-        """
-- **ETFs/Funds** usually have **no earnings** (QQQ, VOO, SOXX etc.).
-- Yahoo can **rate-limit** or **block** certain endpoints occasionally, especially on cloud hosting.
-- This app uses a **hardened Yahoo request**, and then a **yfinance fallback** for both next earnings and history.
-        """.strip()
-    )
-
-run = st.button("Run Earnings Radar", type="primary")
-
-if run:
-    if portfolio_file is None:
-        st.error("Upload a portfolio file first.")
-        st.stop()
-
-    try:
-        pf = read_portfolio_file(portfolio_file)
-    except Exception as e:
-        st.error(f"Could not read file: {e}")
-        st.stop()
-
-    tcol = find_ticker_column(pf)
-    if tcol is None:
-        st.error("No ticker column found. Rename your column to `Ticker` or `Symbol` and retry.")
-        st.stop()
-
-    tickers = pf[tcol].astype(str).apply(_normalize_ticker).dropna().tolist()
-    tickers = [t for t in tickers if t]
-    tickers = list(dict.fromkeys(tickers))
-
-    if not tickers:
-        st.error("No valid tickers found.")
-        st.stop()
-
-    if len(tickers) > max_tickers:
-        st.warning(f"Portfolio has {len(tickers)} tickers — processing first {max_tickers} for speed.")
-        tickers = tickers[:max_tickers]
-
-    st.divider()
-    st.subheader("📦 Portfolio Overview")
-
-    with st.spinner("Fetching 52-week price metrics..."):
-        pm = fetch_1y_price_metrics(tickers)
-
-    # Next earnings per ticker with reasons
-    bar = st.progress(0.0)
-    next_rows = []
-    for i, tk in enumerate(tickers, start=1):
-        nxt, reason = next_earnings_date(tk)
-        next_rows.append({"Ticker": tk, "Next Earnings (UTC)": nxt, "Next Earnings Source": reason})
-        bar.progress(i / max(1, len(tickers)))
-    bar.empty()
-
-    ed = pd.DataFrame(next_rows)
-    ov = pm.merge(ed, on="Ticker", how="left")
-
-    if only_with_next:
-        ov = ov[ov["Next Earnings (UTC)"].notna()].reset_index(drop=True)
-
-    # Display formatting
-    disp = ov.copy()
-    disp["Next Earnings (UTC)"] = pd.to_datetime(disp["Next Earnings (UTC)"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d")
-    disp["Current"] = disp["Current"].apply(lambda x: _fmt_num(x, 2))
-    for c in ["Δ vs 52W High (%)", "Δ vs 52W Low (%)", "52W Range (%)"]:
-        if c in disp.columns:
-            disp[c] = disp[c].apply(lambda x: _fmt_pct(x, 1))
-
-    # sort: earnings date first
-    disp = disp.sort_values("Next Earnings (UTC)", na_position="last")
-
-    cols = ["Ticker", "Next Earnings (UTC)", "Current", "Δ vs 52W High (%)", "Δ vs 52W Low (%)", "52W Range (%)"]
-    if show_source_cols:
-        cols.append("Next Earnings Source")
-
-    st.dataframe(disp[cols], use_container_width=True, hide_index=True)
-
-    st.download_button(
-        "⬇️ Download Portfolio Overview (CSV)",
-        ov.to_csv(index=False),
-        file_name="portfolio_earnings_overview.csv",
-        mime="text/csv",
-    )
-
-    st.divider()
-    st.subheader("🧾 Past 4 Earnings + Price Reaction (per holding)")
-
-    for tk in tickers:
-        with st.expander(tk, expanded=False):
-            e_df, e_src = past_earnings_events(tk, limit=16)
-            if e_df.empty:
-                st.info(f"No earnings history returned for {tk}. Source: {e_src}")
-                continue
-
-            # Keep last 4
-            e_df = e_df.sort_values("Earnings Date (UTC)").tail(4).reset_index(drop=True)
-
-            hist = fetch_price_history(tk, period="2y")
-
-            rows = []
-            for _, r in e_df.iterrows():
-                ts = r["Earnings Date (UTC)"]
-                ctx = event_reaction_metrics(hist, ts)
-
-                rows.append(
-                    {
-                        "Earnings Date (UTC)": pd.to_datetime(ts, utc=True).strftime("%Y-%m-%d"),
-                        "EPS Estimate": r.get("EPS Estimate"),
-                        "Reported EPS": r.get("Reported EPS"),
-                        "Surprise(%)": r.get("Surprise(%)"),
-                        **ctx,
-                    }
-                )
-
-            out = pd.DataFrame(rows)
-
-            # Format
-            disp2 = out.copy()
-            for col in ["EPS Estimate", "Reported EPS", "Event Close (prev)"]:
-                if col in disp2.columns:
-                    disp2[col] = disp2[col].apply(lambda x: _fmt_num(x, 2))
-            for col in ["Surprise(%)", "1D Move (%)", "5D Move (%)"]:
-                if col in disp2.columns:
-                    disp2[col] = disp2[col].apply(lambda x: _fmt_pct(x, 1))
-
-            st.caption(f"Source: {e_src}")
-            st.dataframe(disp2, use_container_width=True, hide_index=True)
+st.divider()
+st.caption(
+    "If a ticker shows no earnings: it may be an ETF/fund, a non-US listing, or the provider may not cover it. "
+    "This app will still show 52-week price context when candles are available."
+)
