@@ -1,5 +1,5 @@
 import math
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -16,8 +16,8 @@ alt.data_transformers.disable_max_rows()
 
 st.title("📡 Earnings Radar")
 st.caption(
-    "Built for portfolio-first earnings monitoring. Upload holdings to get next earnings + price context, "
-    "and review last 4 earnings reactions. Universe radar is optional."
+    "Portfolio-first earnings monitoring. Upload holdings to get next earnings + price context, "
+    "and review last 4 earnings reactions."
 )
 
 # -----------------------------------------------------------------------------
@@ -33,19 +33,6 @@ def _safe_float(x: Any) -> Optional[float]:
         return v
     except Exception:
         return None
-
-
-def _fmt_mcap(x: Any) -> str:
-    v = _safe_float(x)
-    if v is None:
-        return "—"
-    if v >= 1e12:
-        return f"{v/1e12:.2f}T"
-    if v >= 1e9:
-        return f"{v/1e9:.2f}B"
-    if v >= 1e6:
-        return f"{v/1e6:.2f}M"
-    return f"{v:,.0f}"
 
 
 def _fmt_num(x: Any, d: int = 2) -> str:
@@ -66,12 +53,53 @@ def chunk_list(xs: List[str], n: int) -> List[List[str]]:
     return [xs[i: i + n] for i in range(0, len(xs), n)]
 
 
-def today_utc_date() -> datetime:
+def today_utc_date() -> "datetime":
     return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 def _normalize_ticker(t: str) -> str:
     return str(t).upper().strip().replace(".", "-")
+
+
+def read_portfolio_file(uploaded) -> pd.DataFrame:
+    """
+    Reads CSV or Excel based on file extension.
+    """
+    name = (uploaded.name or "").lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(uploaded)
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        return pd.read_excel(uploaded)  # requires openpyxl for .xlsx
+    raise ValueError("Unsupported file type. Please upload a .csv, .xlsx, or .xls file.")
+
+
+def find_ticker_column(df: pd.DataFrame) -> Optional[str]:
+    """
+    Try to locate a ticker column from common names.
+    """
+    candidates = [
+        "Ticker",
+        "Symbol",
+        "Ticker Symbol",
+        "Trading Symbol",
+        "Security",
+        "Instrument",
+    ]
+    cols = list(df.columns)
+
+    # exact match first
+    for c in candidates:
+        if c in cols:
+            return c
+
+    # case-insensitive match
+    lower_map = {str(c).strip().lower(): c for c in cols}
+    for c in candidates:
+        key = str(c).strip().lower()
+        if key in lower_map:
+            return lower_map[key]
+
+    return None
 
 
 # -----------------------------------------------------------------------------
@@ -99,6 +127,14 @@ def load_universe_csv(path: str = "sp500_universe.csv") -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=6 * 3600)
 def fetch_1y_price_metrics(tickers: List[str]) -> pd.DataFrame:
+    """
+    Returns per ticker:
+      - current (last close)
+      - 52w high / low
+      - Δ vs 52w high (%)
+      - Δ vs 52w low (%)
+      - 52w range (%)
+    """
     if not tickers:
         return pd.DataFrame()
 
@@ -180,12 +216,13 @@ def fetch_1y_price_metrics(tickers: List[str]) -> pd.DataFrame:
 
 
 # -----------------------------------------------------------------------------
-# Earnings (slowest; cached)
+# Earnings (cached)
 # -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=6 * 3600)
 def fetch_next_earnings_date(ticker: str) -> Optional[pd.Timestamp]:
     now = today_utc_date()
 
+    # best attempt: earnings table
     try:
         t = yf.Ticker(ticker)
         df = t.get_earnings_dates(limit=12)
@@ -197,6 +234,7 @@ def fetch_next_earnings_date(ticker: str) -> Optional[pd.Timestamp]:
     except Exception:
         pass
 
+    # fallback: info['earningsDate']
     try:
         t = yf.Ticker(ticker)
         info = t.info or {}
@@ -353,219 +391,140 @@ except Exception as e:
 meta = universe[["Ticker", "Company", "Sector", "Industry"]].drop_duplicates(subset=["Ticker"]).set_index("Ticker")
 
 # -----------------------------------------------------------------------------
-# Portfolio-first UI (top of page)
+# Portfolio-first UI
 # -----------------------------------------------------------------------------
 st.subheader("📤 Upload Portfolio (Primary)")
-st.markdown("Upload a CSV with a **Ticker** column. Everything else is optional.")
+st.markdown("Upload a **CSV or Excel** file containing a ticker column (e.g. `Ticker` or `Symbol`).")
 
-portfolio_file = st.file_uploader("Portfolio CSV", type=["csv"], label_visibility="visible")
+portfolio_file = st.file_uploader("Portfolio file", type=["csv", "xlsx", "xls"])
 
 pf_max_names = st.slider("Max tickers to process (speed control)", 5, 120, 40, 5)
 pf_only_next_earnings = st.checkbox("Show only tickers with a next earnings date", value=False)
 pf_run = st.button("Run Portfolio Earnings Radar", type="primary")
 
-with st.popover("ℹ️ CSV format help"):
+with st.popover("ℹ️ File format help"):
     st.markdown(
         """
-Your portfolio CSV needs at least:
-- `Ticker`
+Accepted files:
+- `.csv`
+- `.xlsx` / `.xls`
 
-Optional columns (ignored by this app but fine to include):
-- Shares, MarketValue, CostBasis, Notes, etc.
+We auto-detect ticker columns like:
+`Ticker`, `Symbol`, `Ticker Symbol`, etc.
         """.strip()
     )
 
 if pf_run:
     if portfolio_file is None:
-        st.error("Upload a portfolio CSV first.")
-    else:
-        try:
-            pf = pd.read_csv(portfolio_file)
-            if "Ticker" not in pf.columns:
-                st.error("Portfolio CSV must include a column named `Ticker`.")
-            else:
-                pf_tickers = pf["Ticker"].astype(str).apply(_normalize_ticker).dropna().tolist()
-                pf_tickers = [t for t in pf_tickers if t]
-                pf_tickers = list(dict.fromkeys(pf_tickers))
-                if not pf_tickers:
-                    st.error("No valid tickers found in your portfolio file.")
-                else:
-                    if len(pf_tickers) > pf_max_names:
-                        st.warning(f"Portfolio has {len(pf_tickers)} tickers — showing first {pf_max_names} for speed.")
-                        pf_tickers = pf_tickers[:pf_max_names]
+        st.error("Upload a portfolio file first.")
+        st.stop()
 
-                    # portfolio overview: next earnings + price context
-                    st.divider()
-                    st.subheader("📦 Portfolio Overview")
+    try:
+        pf = read_portfolio_file(portfolio_file)
+    except Exception as e:
+        st.error(f"Could not read portfolio file: {e}")
+        st.stop()
 
-                    with st.spinner("Fetching 1Y price metrics..."):
-                        pm = fetch_1y_price_metrics(pf_tickers)
+    ticker_col = find_ticker_column(pf)
+    if ticker_col is None:
+        st.error("Could not find a ticker column. Rename your column to `Ticker` or `Symbol` and try again.")
+        st.stop()
 
-                    with st.spinner("Fetching next earnings dates (cached)..."):
-                        ed = fetch_earnings_for_list(pf_tickers)
+    pf_tickers = pf[ticker_col].astype(str).apply(_normalize_ticker).dropna().tolist()
+    pf_tickers = [t for t in pf_tickers if t]
+    pf_tickers = list(dict.fromkeys(pf_tickers))
 
-                    ov = pm.merge(ed, on="Ticker", how="left")
-                    ov["Next Earnings (UTC)"] = pd.to_datetime(ov["Next Earnings (UTC)"], utc=True, errors="coerce")
-                    ov["Company"] = ov["Ticker"].apply(lambda t: meta.loc[t, "Company"] if t in meta.index else "")
-                    ov["Sector"] = ov["Ticker"].apply(lambda t: meta.loc[t, "Sector"] if t in meta.index else "")
-                    ov["Industry"] = ov["Ticker"].apply(lambda t: meta.loc[t, "Industry"] if t in meta.index else "")
+    if not pf_tickers:
+        st.error("No valid tickers found in your file.")
+        st.stop()
 
-                    if pf_only_next_earnings:
-                        ov = ov[ov["Next Earnings (UTC)"].notna()].reset_index(drop=True)
+    if len(pf_tickers) > pf_max_names:
+        st.warning(f"Portfolio has {len(pf_tickers)} tickers — showing first {pf_max_names} for speed.")
+        pf_tickers = pf_tickers[:pf_max_names]
 
-                    disp = ov.copy()
-                    disp["Next Earnings (UTC)"] = disp["Next Earnings (UTC)"].dt.strftime("%Y-%m-%d")
-                    disp["Current"] = disp["Current"].apply(lambda x: _fmt_num(x, 2))
-                    disp["52W High"] = disp["52W High"].apply(lambda x: _fmt_num(x, 2))
-                    disp["52W Low"] = disp["52W Low"].apply(lambda x: _fmt_num(x, 2))
-                    for c in ["Δ vs 52W High (%)", "Δ vs 52W Low (%)", "52W Range (%)"]:
-                        disp[c] = disp[c].apply(lambda x: _fmt_pct(x, 1))
+    st.divider()
+    st.subheader("📦 Portfolio Overview")
 
-                    disp = disp.sort_values("Next Earnings (UTC)", ascending=True, na_position="last")
-                    st.dataframe(
-                        disp[
-                            ["Ticker", "Company", "Sector", "Industry", "Next Earnings (UTC)", "Current",
-                             "Δ vs 52W High (%)", "Δ vs 52W Low (%)", "52W Range (%)"]
-                        ],
-                        use_container_width=True,
-                        hide_index=True,
-                    )
+    with st.spinner("Fetching 1Y price metrics..."):
+        pm = fetch_1y_price_metrics(pf_tickers)
 
-                    st.download_button(
-                        "⬇️ Download Portfolio Overview (CSV)",
-                        ov.to_csv(index=False),
-                        file_name="portfolio_earnings_overview.csv",
-                        mime="text/csv",
-                    )
+    with st.spinner("Fetching next earnings dates (cached)..."):
+        ed = fetch_earnings_for_list(pf_tickers)
 
-                    # past 4 earnings per ticker
-                    st.divider()
-                    st.subheader("🧾 Past 4 Earnings (per holding)")
+    ov = pm.merge(ed, on="Ticker", how="left")
+    ov["Next Earnings (UTC)"] = pd.to_datetime(ov["Next Earnings (UTC)"], utc=True, errors="coerce")
+    ov["Company"] = ov["Ticker"].apply(lambda t: meta.loc[t, "Company"] if t in meta.index else "")
+    ov["Sector"] = ov["Ticker"].apply(lambda t: meta.loc[t, "Sector"] if t in meta.index else "")
+    ov["Industry"] = ov["Ticker"].apply(lambda t: meta.loc[t, "Industry"] if t in meta.index else "")
 
-                    with st.popover("ℹ️ Interpreting this"):
-                        st.markdown(
-                            """
-For each of the last 4 earnings events:
-- **Event Close (prev)** is the last trading close on/before the earnings date  
-- **1D / 5D Move** is close-to-close reaction after that day  
-- **Dist vs 52W High/Low** is where it sat vs trailing 252-trading-day high/low at the time
-                            """.strip()
-                        )
+    if pf_only_next_earnings:
+        ov = ov[ov["Next Earnings (UTC)"].notna()].reset_index(drop=True)
 
-                    for tk in pf_tickers:
-                        company = meta.loc[tk, "Company"] if tk in meta.index else ""
-                        exp_title = f"{tk} — {company}" if company else tk
-                        with st.expander(exp_title, expanded=False):
-                            out = portfolio_last4_rows(tk)
-                            if out.empty:
-                                st.info("No past earnings events returned by Yahoo for this ticker.")
-                                continue
+    disp = ov.copy()
+    disp["Next Earnings (UTC)"] = disp["Next Earnings (UTC)"].dt.strftime("%Y-%m-%d")
+    disp["Current"] = disp["Current"].apply(lambda x: _fmt_num(x, 2))
+    disp["52W High"] = disp["52W High"].apply(lambda x: _fmt_num(x, 2))
+    disp["52W Low"] = disp["52W Low"].apply(lambda x: _fmt_num(x, 2))
+    for c in ["Δ vs 52W High (%)", "Δ vs 52W Low (%)", "52W Range (%)"]:
+        disp[c] = disp[c].apply(lambda x: _fmt_pct(x, 1))
 
-                            disp2 = out.copy()
-                            for col in ["EPS Estimate", "Reported EPS", "Event Close (prev)"]:
-                                if col in disp2.columns:
-                                    disp2[col] = disp2[col].apply(lambda x: _fmt_num(x, 2))
-                            for col in ["Surprise(%)", "1D Move (%)", "5D Move (%)", "Dist vs 52W High (%)", "Dist vs 52W Low (%)"]:
-                                if col in disp2.columns:
-                                    disp2[col] = disp2[col].apply(lambda x: _fmt_pct(x, 1))
+    disp = disp.sort_values("Next Earnings (UTC)", ascending=True, na_position="last")
 
-                            order = [
-                                "Earnings Date (UTC)",
-                                "EPS Estimate",
-                                "Reported EPS",
-                                "Surprise(%)",
-                                "Event Close (prev)",
-                                "1D Move (%)",
-                                "5D Move (%)",
-                                "Dist vs 52W High (%)",
-                                "Dist vs 52W Low (%)",
-                            ]
-                            order = [c for c in order if c in disp2.columns]
-                            st.dataframe(disp2[order], use_container_width=True, hide_index=True)
+    st.dataframe(
+        disp[
+            [
+                "Ticker",
+                "Company",
+                "Sector",
+                "Industry",
+                "Next Earnings (UTC)",
+                "Current",
+                "Δ vs 52W High (%)",
+                "Δ vs 52W Low (%)",
+                "52W Range (%)",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
 
-        except Exception as e:
-            st.error(f"Could not read portfolio CSV: {e}")
+    st.download_button(
+        "⬇️ Download Portfolio Overview (CSV)",
+        ov.to_csv(index=False),
+        file_name="portfolio_earnings_overview.csv",
+        mime="text/csv",
+    )
 
-st.divider()
+    st.divider()
+    st.subheader("🧾 Past 4 Earnings (per holding)")
 
-# -----------------------------------------------------------------------------
-# Optional Universe Radar section (kept, but secondary)
-# -----------------------------------------------------------------------------
-with st.expander("📡 Optional: Universe Radar (S&P 500)", expanded=False):
-    st.write("Use this when you want to scan beyond your portfolio.")
+    for tk in pf_tickers:
+        company = meta.loc[tk, "Company"] if tk in meta.index else ""
+        exp_title = f"{tk} — {company}" if company else tk
+        with st.expander(exp_title, expanded=False):
+            out = portfolio_last4_rows(tk)
+            if out.empty:
+                st.info("No past earnings events returned by Yahoo for this ticker.")
+                continue
 
-    with st.sidebar:
-        st.header("Universe Radar Filters")
+            disp2 = out.copy()
+            for col in ["EPS Estimate", "Reported EPS", "Event Close (prev)"]:
+                if col in disp2.columns:
+                    disp2[col] = disp2[col].apply(lambda x: _fmt_num(x, 2))
+            for col in ["Surprise(%)", "1D Move (%)", "5D Move (%)", "Dist vs 52W High (%)", "Dist vs 52W Low (%)"]:
+                if col in disp2.columns:
+                    disp2[col] = disp2[col].apply(lambda x: _fmt_pct(x, 1))
 
-        sectors = sorted([s for s in universe["Sector"].dropna().unique().tolist() if s])
-        sel_sectors = st.multiselect("Radar Sector", sectors, default=sectors)
-
-        ind_pool = universe[universe["Sector"].isin(sel_sectors)]["Industry"].dropna().unique().tolist()
-        industries = sorted([i for i in ind_pool if i])
-        sel_industries = st.multiselect("Radar Industry", industries, default=industries)
-
-        st.divider()
-        include_earnings = st.checkbox("Radar: Include next earnings date", value=True)
-        earnings_window_days = st.slider("Radar: earnings within (days)", 0, 90, 21, 1) if include_earnings else 21
-        max_earnings_fetch = st.slider("Radar: max tickers earnings fetch", 25, 500, 200, 25) if include_earnings else 0
-
-        st.divider()
-        near_high_on = st.checkbox("Radar: Only near 52W High", value=False)
-        near_high_pct = st.slider("Radar: within X% of 52W High", 1, 50, 10, 1, disabled=not near_high_on)
-
-        near_low_on = st.checkbox("Radar: Only near 52W Low", value=False)
-        near_low_pct = st.slider("Radar: within X% of 52W Low", 1, 100, 15, 1, disabled=not near_low_on)
-
-        st.divider()
-        rows_to_show = st.slider("Radar rows to show", 25, 500, 150, 25)
-
-        radar_run = st.button("Run Universe Radar")
-
-    if radar_run:
-        u = universe.copy()
-        u = u[u["Sector"].isin(sel_sectors)]
-        u = u[u["Industry"].isin(sel_industries)]
-        tickers = u["Ticker"].tolist()
-
-        if not tickers:
-            st.warning("No tickers match those Radar filters.")
-        else:
-            with st.spinner(f"Fetching 1Y price metrics for {len(tickers)} tickers..."):
-                pm = fetch_1y_price_metrics(tickers)
-            df = u.merge(pm, on="Ticker", how="left")
-
-            if near_high_on:
-                v = pd.to_numeric(df["Δ vs 52W High (%)"], errors="coerce")
-                df = df[(v <= 0.0) & (v >= -float(near_high_pct))].reset_index(drop=True)
-
-            if near_low_on:
-                v = pd.to_numeric(df["Δ vs 52W Low (%)"], errors="coerce")
-                df = df[(v >= 0.0) & (v <= float(near_low_pct))].reset_index(drop=True)
-
-            if include_earnings and not df.empty:
-                with st.spinner("Fetching next earnings dates (cached) ..."):
-                    ed = fetch_earnings_for_list(df["Ticker"].tolist()[: int(max_earnings_fetch)])
-                df = df.merge(ed, on="Ticker", how="left")
-                now = today_utc_date()
-                end = now + timedelta(days=int(earnings_window_days))
-                df["Next Earnings (UTC)"] = pd.to_datetime(df["Next Earnings (UTC)"], utc=True, errors="coerce")
-                df = df[(df["Next Earnings (UTC)"].isna()) | ((df["Next Earnings (UTC)"] >= pd.Timestamp(now)) & (df["Next Earnings (UTC)"] <= pd.Timestamp(end)))]
-            else:
-                df["Next Earnings (UTC)"] = pd.NaT
-
-            df = df.head(int(rows_to_show)).copy()
-            df["Company Display"] = df["Company"].fillna("").astype(str)
-            df.loc[df["Company Display"].str.len() == 0, "Company Display"] = df["Ticker"]
-
-            table = df[
-                ["Ticker", "Company Display", "Sector", "Industry", "Current", "52W High", "52W Low",
-                 "Δ vs 52W High (%)", "Δ vs 52W Low (%)", "52W Range (%)", "Next Earnings (UTC)"]
-            ].copy()
-
-            for col in ["Current", "52W High", "52W Low"]:
-                table[col] = table[col].apply(lambda x: _fmt_num(x, 2))
-            for col in ["Δ vs 52W High (%)", "Δ vs 52W Low (%)", "52W Range (%)"]:
-                table[col] = table[col].apply(lambda x: _fmt_pct(x, 1))
-            table["Next Earnings (UTC)"] = pd.to_datetime(table["Next Earnings (UTC)"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d")
-
-            st.dataframe(table, use_container_width=True, hide_index=True)
+            order = [
+                "Earnings Date (UTC)",
+                "EPS Estimate",
+                "Reported EPS",
+                "Surprise(%)",
+                "Event Close (prev)",
+                "1D Move (%)",
+                "5D Move (%)",
+                "Dist vs 52W High (%)",
+                "Dist vs 52W Low (%)",
+            ]
+            order = [c for c in order if c in disp2.columns]
+            st.dataframe(disp2[order], use_container_width=True, hide_index=True)
