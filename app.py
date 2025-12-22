@@ -18,27 +18,38 @@ st.set_page_config(
 # -----------------------------
 # Constants
 # -----------------------------
-SP500_UNIVERSE_CSV = "sp500_universe.csv"  # keep this in repo root
+SP500_UNIVERSE_CSV = "sp500_universe.csv"  # put this in your repo root
 FINNHUB_BASE = "https://finnhub.io/api/v1"
+
 
 # -----------------------------
 # Helpers
 # -----------------------------
 def _to_date(x) -> Optional[date]:
-    """Best-effort parse to date."""
+    """Best-effort parse to date (handles common Finnhub strings)."""
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return None
     if isinstance(x, date) and not isinstance(x, datetime):
         return x
     if isinstance(x, datetime):
         return x.date()
+
     if isinstance(x, str):
         s = x.strip()
         if not s:
             return None
-        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
+        # Handle ISO timestamps like 2025-01-30T00:00:00.000Z
+        s2 = s.replace("T", " ").replace("Z", "")
+        for fmt in (
+            "%Y-%m-%d",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%m/%d/%Y",
+            "%d/%m/%Y",
+            "%Y/%m/%d",
+        ):
             try:
-                return datetime.strptime(s, fmt).date()
+                return datetime.strptime(s2, fmt).date()
             except Exception:
                 pass
     return None
@@ -92,7 +103,9 @@ def _extract_tickers_from_df(df: pd.DataFrame) -> List[str]:
         ticker_col = df.columns[0]
     tickers = df[ticker_col].astype(str).map(_clean_ticker).tolist()
     tickers = [t for t in tickers if t and t not in ("NAN", "NONE")]
-    seen, out = set(), []
+    # de-dupe preserving order
+    seen = set()
+    out = []
     for t in tickers:
         if t not in seen:
             seen.add(t)
@@ -102,7 +115,7 @@ def _extract_tickers_from_df(df: pd.DataFrame) -> List[str]:
 
 @st.cache_data(ttl=24 * 3600)
 def load_sp500_universe_map() -> pd.DataFrame:
-    """Load optional mapping (Ticker -> Company/Sector/Industry)."""
+    """Load S&P 500 mapping if file exists (Ticker -> Company/Sector/Industry)."""
     try:
         df = pd.read_csv(SP500_UNIVERSE_CSV)
         rename = {}
@@ -127,6 +140,7 @@ def load_sp500_universe_map() -> pd.DataFrame:
 
 
 def get_finnhub_key() -> Optional[str]:
+    key = None
     try:
         key = st.secrets.get("FINNHUB_API_KEY", None)
     except Exception:
@@ -155,9 +169,9 @@ def finnhub_get(endpoint: str, params: Dict, api_key: str) -> Tuple[int, dict]:
         return 0, {}
 
 
-@st.cache_data(ttl=4 * 3600)
+@st.cache_data(ttl=6 * 3600)
 def finnhub_next_earnings_date(symbol: str, lookahead_days: int, api_key: str) -> Optional[date]:
-    """Next earnings date (Finnhub earnings calendar) within lookahead window."""
+    """Get the next earnings date from Finnhub earnings calendar within lookahead window."""
     sym = _clean_ticker(symbol)
     today = date.today()
     to_d = today + timedelta(days=int(lookahead_days))
@@ -181,76 +195,159 @@ def finnhub_next_earnings_date(symbol: str, lookahead_days: int, api_key: str) -
         d = _to_date(item.get("date"))
         if d is not None and d >= today:
             dates.append(d)
-    return min(dates) if dates else None
+    if not dates:
+        return None
+    return min(dates)
 
 
 @st.cache_data(ttl=12 * 3600)
-def finnhub_past_earnings_calendar(symbol: str, limit: int, api_key: str) -> pd.DataFrame:
-    """
-    Past earnings events using Finnhub calendar (this gives REAL event dates).
-    Includes EPS actual/estimate/surprise fields when provided.
-    """
+def finnhub_stock_earnings(symbol: str, limit: int, api_key: str) -> pd.DataFrame:
+    """Past earnings fundamentals (EPS actual/estimate) from Finnhub /stock/earnings."""
     sym = _clean_ticker(symbol)
-    today = date.today()
-    frm = (today - timedelta(days=900)).isoformat()
-    to = (today + timedelta(days=30)).isoformat()
-
-    status, js = finnhub_get(
-        "/calendar/earnings",
-        {"from": frm, "to": to, "symbol": sym},
-        api_key=api_key,
-    )
-    if status != 200 or not isinstance(js, dict):
-        return pd.DataFrame()
-
-    items = js.get("earningsCalendar", [])
-    if not isinstance(items, list) or not items:
+    status, js = finnhub_get("/stock/earnings", {"symbol": sym, "limit": int(limit)}, api_key=api_key)
+    if status != 200 or not isinstance(js, list):
         return pd.DataFrame()
 
     rows = []
-    for it in items:
-        if not isinstance(it, dict):
+    for item in js:
+        if not isinstance(item, dict):
             continue
-        if _clean_ticker(it.get("symbol", "")) != sym:
-            continue
-        d = _to_date(it.get("date"))
-        if d is None or d > today:
-            continue
-
-        eps_act = _safe_float(it.get("epsActual"))
-        eps_est = _safe_float(it.get("epsEstimate"))
-        surprise = _safe_float(it.get("epsSurprise"))
-        surprise_pct = _safe_float(it.get("epsSurprisePercent"))
-
-        # some variants use different keys
-        if surprise is None and eps_act is not None and eps_est is not None:
-            surprise = eps_act - eps_est
-        if surprise_pct is None and surprise is not None and eps_est not in (None, 0):
-            surprise_pct = (surprise / eps_est) * 100.0
-
+        # fields: period, actual, estimate, surprise, surprisePercent, year, quarter
         rows.append(
             {
-                "Earnings Date": d,
-                "Year": it.get("year"),
-                "Quarter": it.get("quarter"),
-                "EPS Actual": eps_act,
-                "EPS Est.": eps_est,
-                "Surprise": surprise,
-                "Surprise %": surprise_pct,
-                "Time (approx)": it.get("hour"),  # sometimes present
+                "Year": item.get("year"),
+                "Quarter": item.get("quarter"),
+                "Period": item.get("period"),
+                "EPS Actual": _safe_float(item.get("actual")),
+                "EPS Est.": _safe_float(item.get("estimate")),
+                "Surprise": _safe_float(item.get("surprise")),
+                "Surprise %": _safe_float(item.get("surprisePercent")),
             }
         )
-
     df = pd.DataFrame(rows)
-    if df.empty:
-        return df
+    return df
+
+
+@st.cache_data(ttl=12 * 3600)
+def finnhub_past_earnings_dates_from_calendar(symbol: str, api_key: str, limit: int = 4) -> pd.DataFrame:
+    """
+    Get past earnings EVENT dates via Finnhub calendar reliably by paging backwards
+    in smaller windows (some accounts/APIs return empty if you request huge ranges).
+    """
+    sym = _clean_ticker(symbol)
+    today = date.today()
+
+    # Keep windows small to avoid API limitations (works more reliably than 900-day in one shot)
+    window_days = 120
+    max_windows = 10  # 10*120 ~ 1200 days back
+
+    events: List[dict] = []
+    seen_keys = set()
+
+    end = today
+    for _ in range(max_windows):
+        start = end - timedelta(days=window_days)
+        status, js = finnhub_get(
+            "/calendar/earnings",
+            {"from": start.isoformat(), "to": end.isoformat(), "symbol": sym},
+            api_key=api_key,
+        )
+        if status == 200 and isinstance(js, dict):
+            items = js.get("earningsCalendar", [])
+            if isinstance(items, list):
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    if _clean_ticker(it.get("symbol", "")) != sym:
+                        continue
+                    d = _to_date(it.get("date"))
+                    if d is None or d > today:
+                        continue
+                    y = it.get("year")
+                    q = it.get("quarter")
+                    key = (d, y, q)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    events.append(
+                        {
+                            "Earnings Date": d,
+                            "Year": y,
+                            "Quarter": q,
+                            "EPS Actual": _safe_float(it.get("epsActual")),
+                            "EPS Est.": _safe_float(it.get("epsEstimate")),
+                            "Surprise": _safe_float(it.get("epsSurprise")),
+                            "Surprise %": _safe_float(it.get("epsSurprisePercent")),
+                        }
+                    )
+
+        # move window back
+        end = start - timedelta(days=1)
+
+        # early stop if we already have enough events
+        if len(events) >= limit:
+            break
+
+    if not events:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(events)
     df = df.sort_values("Earnings Date", ascending=False).head(int(limit)).reset_index(drop=True)
     return df
 
 
+def merge_earnings_dates_with_eps(symbol: str, api_key: str, limit: int = 4) -> pd.DataFrame:
+    """
+    Goal:
+      - Earnings Date: from Finnhub calendar (event date)
+      - EPS fields: from calendar if present, else backfill from /stock/earnings by (Year, Quarter).
+    """
+    dates_df = finnhub_past_earnings_dates_from_calendar(symbol, api_key=api_key, limit=limit)
+
+    # If calendar has nothing, fall back to /stock/earnings (still shows “past 4 quarters”)
+    if dates_df is None or dates_df.empty:
+        se = finnhub_stock_earnings(symbol, limit=limit, api_key=api_key)
+        if se is None or se.empty:
+            return pd.DataFrame()
+        # Use Period as the date-ish field (not perfect, but better than nothing)
+        se = se.copy()
+        se["Earnings Date"] = se["Period"].apply(_to_date)
+        se = se[["Earnings Date", "Year", "Quarter", "Period", "EPS Actual", "EPS Est.", "Surprise", "Surprise %"]]
+        se = se.sort_values("Earnings Date", ascending=False).head(int(limit)).reset_index(drop=True)
+        return se
+
+    # Backfill EPS from /stock/earnings when calendar EPS fields are missing
+    se = finnhub_stock_earnings(symbol, limit=12, api_key=api_key)
+    se_map = {}
+    if se is not None and not se.empty:
+        for _, r in se.iterrows():
+            se_map[(r.get("Year"), r.get("Quarter"))] = r
+
+    out_rows = []
+    for _, r in dates_df.iterrows():
+        y, q = r.get("Year"), r.get("Quarter")
+        row = dict(r)
+
+        # If any EPS fields missing, try /stock/earnings match
+        need = any(row.get(k) is None or (isinstance(row.get(k), float) and np.isnan(row.get(k)))
+                   for k in ["EPS Actual", "EPS Est.", "Surprise", "Surprise %"])
+        if need and (y, q) in se_map:
+            rr = se_map[(y, q)]
+            row["EPS Actual"] = row.get("EPS Actual") if row.get("EPS Actual") is not None else rr.get("EPS Actual")
+            row["EPS Est."] = row.get("EPS Est.") if row.get("EPS Est.") is not None else rr.get("EPS Est.")
+            row["Surprise"] = row.get("Surprise") if row.get("Surprise") is not None else rr.get("Surprise")
+            row["Surprise %"] = row.get("Surprise %") if row.get("Surprise %") is not None else rr.get("Surprise %")
+
+        out_rows.append(row)
+
+    out = pd.DataFrame(out_rows)
+    out = out.sort_values("Earnings Date", ascending=False).head(int(limit)).reset_index(drop=True)
+    return out
+
+
 @st.cache_data(ttl=24 * 3600)
 def yf_fast_info(ticker: str) -> Dict:
-    """Fast info per ticker (more reliable than batch downloads for 'Current/52W')."""
+    """Fast info per ticker (market cap etc). Cached heavily."""
     try:
         t = yf.Ticker(ticker)
         fi = getattr(t, "fast_info", None)
@@ -263,9 +360,16 @@ def yf_fast_info(ticker: str) -> Dict:
 
 @st.cache_data(ttl=6 * 3600)
 def yf_history_1y_single(ticker: str) -> pd.DataFrame:
-    """1Y history fallback if fast_info missing year_high/year_low/last_price."""
+    """1Y daily history fallback (fills missing Current/52W fields)."""
     try:
-        df = yf.download(ticker, period="1y", interval="1d", auto_adjust=False, progress=False, threads=False)
+        df = yf.download(
+            ticker,
+            period="1y",
+            interval="1d",
+            auto_adjust=False,
+            threads=False,
+            progress=False,
+        )
         if isinstance(df, pd.DataFrame) and not df.empty:
             df = df.copy()
             df.index = pd.to_datetime(df.index).date
@@ -276,9 +380,16 @@ def yf_history_1y_single(ticker: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=6 * 3600)
 def yf_history_2y_single(ticker: str) -> pd.DataFrame:
-    """2Y daily history for one ticker (for reactions around earnings)."""
+    """2Y daily history for one ticker (for reactions around last 4 earnings)."""
     try:
-        df = yf.download(ticker, period="2y", interval="1d", auto_adjust=False, progress=False, threads=False)
+        df = yf.download(
+            ticker,
+            period="2y",
+            interval="1d",
+            auto_adjust=False,
+            threads=False,
+            progress=False,
+        )
         if isinstance(df, pd.DataFrame) and not df.empty:
             df = df.copy()
             df.index = pd.to_datetime(df.index).date
@@ -287,9 +398,36 @@ def yf_history_2y_single(ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _get_current_high_low_52w(ticker: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    Robust: try yfinance fast_info first, then fallback to 1Y history.
+    """
+    fi = yf_fast_info(ticker)
+
+    current = _safe_float(fi.get("last_price") or fi.get("lastPrice") or fi.get("regular_market_price"))
+    high52 = _safe_float(fi.get("year_high") or fi.get("yearHigh"))
+    low52 = _safe_float(fi.get("year_low") or fi.get("yearLow"))
+
+    if current is not None and high52 is not None and low52 is not None:
+        return current, high52, low52
+
+    hist = yf_history_1y_single(ticker)
+    if hist is None or hist.empty or "Close" not in hist.columns:
+        return current, high52, low52
+
+    close = hist["Close"].dropna()
+    if close.empty:
+        return current, high52, low52
+
+    current = current if current is not None else float(close.iloc[-1])
+    high52 = high52 if high52 is not None else float(close.max())
+    low52 = low52 if low52 is not None else float(close.min())
+    return current, high52, low52
+
+
 def compute_reaction_from_history(hist: pd.DataFrame, event_date: date) -> Dict:
     """
-    Using daily closes:
+    Given daily history indexed by date, compute:
     - pre_close: last close strictly before event_date
     - post_close_1d: first close strictly after event_date
     - post_close_3d: third trading close strictly after event_date
@@ -318,7 +456,6 @@ def compute_reaction_from_history(hist: pd.DataFrame, event_date: date) -> Dict:
 
     pre_d = pre_dates[-1]
     post1_d = post_dates[0]
-
     out["Pre Close Date"] = pre_d
     out["Pre Close"] = float(closes[pre_d])
     out["Post Close (1D) Date"] = post1_d
@@ -337,68 +474,13 @@ def compute_reaction_from_history(hist: pd.DataFrame, event_date: date) -> Dict:
     return out
 
 
-def _pick_first(*vals):
-    for v in vals:
-        if v is None:
-            continue
-        if isinstance(v, float) and np.isnan(v):
-            continue
-        return v
-    return None
-
-
-def get_price_52w_from_yf(ticker: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """
-    Return (current, high52, low52) using fast_info first; fallback to 1y history.
-    """
-    fi = yf_fast_info(ticker)
-    current = _safe_float(_pick_first(fi.get("last_price"), fi.get("lastPrice"), fi.get("regular_market_price")))
-    high52 = _safe_float(_pick_first(fi.get("year_high"), fi.get("yearHigh")))
-    low52 = _safe_float(_pick_first(fi.get("year_low"), fi.get("yearLow")))
-
-    if current is not None and high52 is not None and low52 is not None:
-        return current, high52, low52
-
-    hist = yf_history_1y_single(ticker)
-    if hist is None or hist.empty or "Close" not in hist.columns:
-        return current, high52, low52
-
-    close = hist["Close"].dropna()
-    if close.empty:
-        return current, high52, low52
-
-    current = current if current is not None else float(close.iloc[-1])
-    high52 = high52 if high52 is not None else float(close.max())
-    low52 = low52 if low52 is not None else float(close.min())
-    return current, high52, low52
-
-
-def get_market_cap_from_yf(ticker: str) -> Optional[float]:
-    fi = yf_fast_info(ticker)
-    return _safe_float(_pick_first(fi.get("market_cap"), fi.get("marketCap")))
-
-
-def get_company_meta_fallback(ticker: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    Slow fallback only if we couldn't get company/sector/industry from SP500 map.
-    """
-    try:
-        info = yf.Ticker(ticker).get_info()
-        company = info.get("shortName") or info.get("longName")
-        sector = info.get("sector")
-        industry = info.get("industry")
-        return company, sector, industry
-    except Exception:
-        return None, None, None
-
-
 # -----------------------------
 # UI: Header + Upload (visible)
 # -----------------------------
 st.title("📅 Earnings Radar (Portfolio)")
 st.caption(
     "Upload your holdings (CSV/XLSX) or paste tickers. "
-    "Next earnings + past 4 earnings events (Finnhub). "
+    "Next earnings + past 4 earnings event dates (Finnhub). "
     "Market cap + price + 52-week stats + reactions (Yahoo Finance via yfinance)."
 )
 
@@ -414,6 +496,7 @@ with col_u1:
         type=["csv", "xlsx", "xls"],
         help="Must contain a ticker column (Ticker/Symbol) or have tickers in the first column.",
     )
+
 with col_u2:
     pasted = st.text_input(
         "No file? Paste tickers (comma-separated)",
@@ -429,6 +512,9 @@ max_tickers = st.sidebar.slider("Max tickers to process", 5, 300, 60, 5)
 
 only_with_upcoming = st.sidebar.checkbox("Show only holdings with an upcoming earnings date", value=True)
 within_days = st.sidebar.slider("Upcoming earnings within (days)", 1, min(lookahead_days, 365), 60, 1)
+
+# IMPORTANT: gating heavy per-ticker 2Y history calls
+compute_reactions = st.sidebar.checkbox("Compute price reaction (1D/3D) in Past Earnings section (slower)", value=True)
 
 st.sidebar.caption("Tip: fewer tickers = faster. Caching helps a lot after the first run.")
 run = st.sidebar.button("🚀 Run Earnings Radar", use_container_width=True)
@@ -455,8 +541,8 @@ if pasted and pasted.strip():
     seen = set(tickers)
     for t in pasted_list:
         if t and t not in seen:
-            seen.add(t)
             tickers.append(t)
+            seen.add(t)
 
 tickers = tickers[: int(max_tickers)]
 
@@ -476,39 +562,44 @@ if run:
         sp500_lookup = sp500_map.set_index("Ticker").to_dict(orient="index")
 
     rows = []
-    progress = st.progress(0, text="Fetching earnings + market/price stats...")
+    progress = st.progress(0, text="Fetching earnings + price stats...")
     total = len(tickers)
 
     for i, t in enumerate(tickers):
+        # SP500 metadata
         meta = sp500_lookup.get(t, {})
-        company = meta.get("Company")
-        sector = meta.get("Sector")
-        industry = meta.get("Industry")
+        company = meta.get("Company", None)
+        sector = meta.get("Sector", None)
+        industry = meta.get("Industry", None)
 
-        # Next earnings (Finnhub)
+        # Next earnings from Finnhub
         next_e = finnhub_next_earnings_date(t, lookahead_days=lookahead_days, api_key=api_key)
-        days_to = (next_e - date.today()).days if next_e else None
+        days_to = (next_e - date.today()).days if next_e is not None else None
 
-        # Market + 52W (yfinance)
-        mcap = get_market_cap_from_yf(t)
-        current, high52, low52 = get_price_52w_from_yf(t)
+        # yfinance: market cap + current + 52W (robust)
+        fi = yf_fast_info(t)
+        mcap = _safe_float(fi.get("market_cap")) or _safe_float(fi.get("marketCap"))
+        current, high52, low52 = _get_current_high_low_52w(t)
 
-        # If still missing labels, slow fallback
+        # Fallback company/sector/industry from yfinance if missing
         if not company or not sector or not industry:
-            c2, s2, i2 = get_company_meta_fallback(t)
-            company = company or c2
-            sector = sector or s2
-            industry = industry or i2
+            try:
+                info = yf.Ticker(t).get_info()
+                company = company or info.get("shortName") or info.get("longName")
+                sector = sector or info.get("sector")
+                industry = industry or info.get("industry")
+            except Exception:
+                pass
 
         # Derived %s
         d_vs_high = None
         d_vs_low = None
         r52 = None
-        if current is not None and high52 not in (None, 0):
+        if current is not None and high52 is not None and high52 != 0:
             d_vs_high = (current - high52) / high52 * 100.0
-        if current is not None and low52 not in (None, 0):
+        if current is not None and low52 is not None and low52 != 0:
             d_vs_low = (current - low52) / low52 * 100.0
-        if high52 is not None and low52 not in (None, 0):
+        if high52 is not None and low52 is not None and low52 != 0:
             r52 = (high52 - low52) / low52 * 100.0
 
         rows.append(
@@ -544,6 +635,7 @@ if run:
         filtered = filtered[filtered["Days to Earnings"].notna()].copy()
         filtered = filtered[(filtered["Days to Earnings"] >= 0) & (filtered["Days to Earnings"] <= within_days)].copy()
 
+    # Sort
     if not filtered.empty:
         filtered = filtered.sort_values(["Days to Earnings", "Ticker"], ascending=[True, True])
 
@@ -553,13 +645,9 @@ if run:
     st.subheader("2) Portfolio Overview")
 
     if filtered.empty:
-        st.warning(
-            "No holdings matched your filters (try turning off 'Show only holdings with an upcoming earnings date')."
-        )
+        st.warning("No holdings matched your filters (try turning off 'Show only holdings with an upcoming earnings date').")
     else:
         view = filtered.copy()
-
-        # keep numeric columns numeric (sortable), but show market cap nicely
         view["Market Cap"] = view["Market Cap"].apply(_fmt_money)
         view["Next Earnings"] = view["Next Earnings"].astype("object")
 
@@ -591,28 +679,28 @@ if run:
     # -----------------------------
     st.subheader("3) Past 4 Earnings + Price Reaction (per holding)")
     st.caption(
-        "Earnings events come from Finnhub calendar (reliable dates). "
-        "Price reaction uses Yahoo Finance daily closes (yfinance): "
-        "pre-close = last close before earnings date; 1D/3D = 1st and 3rd trading closes after."
+        "Earnings event dates are pulled from Finnhub calendar (paged in small windows for reliability). "
+        "EPS data is backfilled from Finnhub /stock/earnings if needed. "
+        "Price reaction uses daily closes from Yahoo Finance (yfinance)."
     )
 
-    # Lookup for company name in expanders
+    # iterate ORIGINAL tickers list (not filtered)
     row_by_ticker = {r["Ticker"]: r for r in rows}
 
     for t in tickers:
-        company = (row_by_ticker.get(t) or {}).get("Company")
+        company = (row_by_ticker.get(t) or {}).get("Company", None)
         label = f"{t}" + (f" — {company}" if company else "")
+
         with st.expander(label, expanded=False):
-            earn_df = finnhub_past_earnings_calendar(t, limit=4, api_key=api_key)
+            # IMPORTANT: past 4 quarters must show again
+            earn_df = merge_earnings_dates_with_eps(t, api_key=api_key, limit=4)
 
             if earn_df is None or earn_df.empty:
-                st.info("No recent earnings events found for this ticker in Finnhub calendar.")
+                st.info("No earnings history returned (common for ETFs/funds or incomplete listings).")
                 continue
 
-            # Let user opt-in to price reactions per ticker (keeps app fast/reliable)
-            do_reaction = st.toggle("Compute price reaction (1D / 3D)", value=True, key=f"react_{t}")
-
-            if not do_reaction:
+            # If user disabled reactions, just show the table
+            if not compute_reactions:
                 st.dataframe(
                     earn_df,
                     use_container_width=True,
@@ -642,16 +730,21 @@ if run:
                     ed = _to_date(ed)
 
                 base = dict(row)
-                if ed is not None:
-                    base.update(compute_reaction_from_history(hist2y, ed))
+                if ed is None:
+                    enriched.append(base)
+                    continue
+
+                base.update(compute_reaction_from_history(hist2y, ed))
                 enriched.append(base)
 
             out_df = pd.DataFrame(enriched)
 
+            # clean order (keep Period if it exists from fallback)
             keep_cols = [
                 "Earnings Date",
                 "Year",
                 "Quarter",
+                "Period",
                 "EPS Actual",
                 "EPS Est.",
                 "Surprise",
