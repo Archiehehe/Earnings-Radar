@@ -14,44 +14,30 @@ MAX_WORKERS = 8
 st.set_page_config(page_title="Earnings Calendar Tracker", layout="wide")
 
 # =========================
-# HELPERS
+# FORMATTERS
 # =========================
-def safe_float(x):
-    try:
-        return float(x)
-    except Exception:
+def fmt_big(n):
+    if n is None:
         return None
+    n = float(n)
+    if n >= 1e12:
+        return f"{n/1e12:.2f}T"
+    if n >= 1e9:
+        return f"{n/1e9:.2f}B"
+    if n >= 1e6:
+        return f"{n/1e6:.2f}M"
+    return f"{n:.2f}"
 
 
 def pct(a, b):
     if a is None or b in (None, 0):
         return None
-    return (a - b) / b * 100
+    return round((a - b) / b * 100, 2)
 
 
 # =========================
-# FINNHUB
+# FINNHUB (PAST EARNINGS)
 # =========================
-def finnhub_next_earnings(ticker, lookahead_days):
-    try:
-        today = datetime.utcnow().date()
-        end = today + timedelta(days=lookahead_days)
-
-        url = (
-            "https://finnhub.io/api/v1/calendar/earnings"
-            f"?from={today}&to={end}&token={FINNHUB_API_KEY}"
-        )
-        r = requests.get(url, timeout=10).json()
-
-        for e in r.get("earningsCalendar", []):
-            if e.get("symbol") == ticker:
-                return pd.to_datetime(e["date"]).date()
-    except Exception:
-        pass
-
-    return None
-
-
 def finnhub_past_earnings(ticker, limit=4):
     try:
         url = f"https://finnhub.io/api/v1/stock/earnings?symbol={ticker}&token={FINNHUB_API_KEY}"
@@ -63,6 +49,20 @@ def finnhub_past_earnings(ticker, limit=4):
     except Exception:
         pass
     return pd.DataFrame()
+
+
+# =========================
+# NEXT EARNINGS (YAHOO FALLBACK)
+# =========================
+def next_earnings_yahoo(ticker):
+    try:
+        cal = yf.Ticker(ticker).calendar
+        if isinstance(cal, pd.DataFrame) and not cal.empty:
+            d = cal.loc["Earnings Date"].iloc[0]
+            return pd.to_datetime(d).date()
+    except Exception:
+        pass
+    return None
 
 
 # =========================
@@ -83,20 +83,20 @@ def yf_prices(tickers, period):
 def market_cap(ticker):
     try:
         fi = yf.Ticker(ticker).fast_info
-        return safe_float(fi.get("market_cap") or fi.get("marketCap"))
+        return fi.get("market_cap") or fi.get("marketCap")
     except Exception:
         return None
 
 
 # =========================
-# REACTIONS
+# PRICE REACTION
 # =========================
 def reaction(price_df, date, days):
     try:
         d = pd.to_datetime(date).normalize()
         pre = price_df.loc[:d].iloc[-1]["Close"]
         post = price_df.loc[d + timedelta(days=days):].iloc[0]["Close"]
-        return pct(post, pre)
+        return round((post - pre) / pre * 100, 2)
     except Exception:
         return None
 
@@ -104,58 +104,61 @@ def reaction(price_df, date, days):
 # =========================
 # MAIN FETCH
 # =========================
-def fetch_all(tickers, lookahead_days, progress):
+def fetch_all(tickers, progress):
     rows = []
 
     prices_1y = yf_prices(tickers, "1y")
     prices_2y = yf_prices(tickers, "2y")
 
-    # Market caps (parallel)
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
         mcaps = dict(zip(tickers, ex.map(market_cap, tickers)))
 
-    # Next earnings (parallel)
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
-        futures = {ex.submit(finnhub_next_earnings, t, lookahead_days): t for t in tickers}
-        next_earn = {futures[f]: f.result() for f in as_completed(futures)}
+        past = dict(zip(tickers, ex.map(finnhub_past_earnings, tickers)))
 
-    # Past earnings (parallel)
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
-        futures = {ex.submit(finnhub_past_earnings, t): t for t in tickers}
-        past_earn = {futures[f]: f.result() for f in as_completed(futures)}
+        next_e = dict(zip(tickers, ex.map(next_earnings_yahoo, tickers)))
 
     for i, t in enumerate(tickers):
         try:
-            p1 = prices_1y[t] if isinstance(prices_1y.columns, pd.MultiIndex) else prices_1y
-            p2 = prices_2y[t] if isinstance(prices_2y.columns, pd.MultiIndex) else prices_2y
+            p1 = prices_1y[t]
+            p2 = prices_2y[t]
 
-            current = safe_float(p1["Close"].iloc[-1])
-            high52 = safe_float(p1["High"].max())
-            low52 = safe_float(p1["Low"].min())
+            current = p1["Close"].iloc[-1]
+            high52 = p1["High"].max()
+            low52 = p1["Low"].min()
 
-            earn_rows = []
-            df = past_earn.get(t, pd.DataFrame())
-            for _, r in df.iterrows():
-                earn_rows.append({
-                    "Date": r["date"].date(),
-                    "EPS Actual": r.get("actual"),
-                    "EPS Est.": r.get("estimate"),
-                    "Surprise": r.get("surprise"),
-                    "1D Reaction %": reaction(p2, r["date"], 1),
-                    "3D Reaction %": reaction(p2, r["date"], 3),
+            df = past.get(t, pd.DataFrame())
+
+            if df.empty:
+                rows.append({
+                    "Ticker": t,
+                    "Market Cap": fmt_big(mcaps.get(t)),
+                    "Current Price": round(current, 2),
+                    "52W High": round(high52, 2),
+                    "52W Low": round(low52, 2),
+                    "Δ vs 52W High %": pct(current, high52),
+                    "Δ vs 52W Low %": pct(current, low52),
+                    "Next Earnings": next_e.get(t),
                 })
-
-            rows.append({
-                "Ticker": t,
-                "Market Cap": mcaps.get(t),
-                "Current Price": current,
-                "52W High": high52,
-                "52W Low": low52,
-                "Δ vs 52W High %": pct(current, high52),
-                "Δ vs 52W Low %": pct(current, low52),
-                "Next Earnings": next_earn.get(t),
-                "Earnings": earn_rows,
-            })
+            else:
+                for _, r in df.iterrows():
+                    rows.append({
+                        "Ticker": t,
+                        "Market Cap": fmt_big(mcaps.get(t)),
+                        "Current Price": round(current, 2),
+                        "52W High": round(high52, 2),
+                        "52W Low": round(low52, 2),
+                        "Δ vs 52W High %": pct(current, high52),
+                        "Δ vs 52W Low %": pct(current, low52),
+                        "Next Earnings": next_e.get(t),
+                        "Earnings Date": r["date"].date(),
+                        "EPS Actual": r.get("actual"),
+                        "EPS Est.": r.get("estimate"),
+                        "Surprise": r.get("surprise"),
+                        "1D Reaction %": reaction(p2, r["date"], 1),
+                        "3D Reaction %": reaction(p2, r["date"], 3),
+                    })
 
         except Exception:
             rows.append({"Ticker": t})
@@ -170,67 +173,27 @@ def fetch_all(tickers, lookahead_days, progress):
 # =========================
 st.title("📅 Earnings Calendar Tracker")
 
-# ---- UPLOAD FILES ----
 uploaded_files = st.file_uploader(
-    "Upload CSV or Excel files (Ticker column required)",
+    "Upload CSV or Excel (Ticker / Symbol column)",
     type=["csv", "xlsx", "xls"],
     accept_multiple_files=True,
 )
 
-tickers_text = st.text_area(
-    "Enter tickers (comma or newline separated)",
-    "AAPL\nMSFT\nNVDA\nGOOGL",
-)
+text = st.text_area("Enter tickers", "AAPL\nMSFT\nNVDA\nGOOGL")
 
-lookahead_days = st.slider("Lookahead days", 30, 180, 90)
-
-# ---- PARSE TICKERS ----
 tickers = set()
 
 if uploaded_files:
     for f in uploaded_files:
-        try:
-            if f.name.lower().endswith(".csv"):
-                df = pd.read_csv(f)
-            else:
-                df = pd.read_excel(f)
+        df = pd.read_excel(f) if f.name.endswith(("xls", "xlsx")) else pd.read_csv(f)
+        for c in ["Ticker", "Symbol", "ticker", "symbol"]:
+            if c in df.columns:
+                tickers.update(df[c].dropna().astype(str).str.upper())
 
-            for col in ["Ticker", "Symbol", "ticker", "symbol"]:
-                if col in df.columns:
-                    tickers.update(
-                        df[col].dropna().astype(str).str.upper()
-                    )
-                    break
-        except Exception:
-            st.warning(f"Could not read {f.name}")
-
-tickers.update(
-    t.strip().upper()
-    for t in tickers_text.replace(",", "\n").split()
-    if t.strip()
-)
-
+tickers.update(t.strip().upper() for t in text.replace(",", "\n").split() if t.strip())
 tickers = sorted(tickers)
 
-# ---- RUN ----
 if st.button("Fetch Earnings"):
-    if not tickers:
-        st.warning("No tickers provided")
-    else:
-        progress = st.progress(0.0)
-        data = fetch_all(tickers, lookahead_days, progress)
-
-        # Flatten earnings rows
-        rows = []
-        for r in data:
-            if not r.get("Earnings"):
-                rows.append(r)
-            else:
-                for e in r["Earnings"]:
-                    row = r.copy()
-                    row.update(e)
-                    row.pop("Earnings", None)
-                    rows.append(row)
-
-        df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True)
+    progress = st.progress(0.0)
+    data = fetch_all(tickers, progress)
+    st.dataframe(pd.DataFrame(data), use_container_width=True)
