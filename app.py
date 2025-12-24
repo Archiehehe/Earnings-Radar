@@ -34,6 +34,18 @@ def is_future(date_obj):
         return False
     return date_obj >= datetime.now().date()
 
+def format_market_cap(val):
+    """Truncate large market cap numbers to M, B, or T"""
+    if val is None or not isinstance(val, (int, float)):
+        return "N/A"
+    if val >= 1e12:
+        return f"{val / 1e12:.2f}T"
+    elif val >= 1e9:
+        return f"{val / 1e9:.2f}B"
+    elif val >= 1e6:
+        return f"{val / 1e6:.2f}M"
+    return f"{val:.2f}"
+
 # =========================
 # NEXT EARNINGS (MULTIPLE METHODS)
 # =========================
@@ -78,10 +90,8 @@ def get_next_earnings_yf_calendar(ticker):
         stock = yf.Ticker(ticker)
         cal = stock.calendar
         if cal is not None and not cal.empty:
-            # Check for Earnings Date row
             if 'Earnings Date' in cal.index:
                 dates = cal.loc['Earnings Date']
-                # If multiple dates provided, check each
                 if isinstance(dates, (list, pd.Series)):
                     for d in dates:
                         dt = pd.to_datetime(d).date()
@@ -122,7 +132,7 @@ def get_next_earnings(ticker):
         result = method(ticker)
         if result and is_future(result):
             return result
-    return "TBD"  # Return TBD if no future date is found
+    return "TBD"
 
 # =========================
 # FINNHUB (PAST EARNINGS)
@@ -217,7 +227,6 @@ def fetch_all(tickers, progress):
                         "3D Reaction %": reaction(p2, r["date"], 3),
                     })
             
-            # If no historical earnings found, create a placeholder row
             if not earn_rows:
                 earn_rows.append({
                     "Date": None, "EPS Actual": None, "EPS Est.": None,
@@ -227,7 +236,7 @@ def fetch_all(tickers, progress):
             for e in earn_rows:
                 rows.append({
                     "Ticker": t,
-                    "Market Cap": mcaps.get(t),
+                    "Market Cap": format_market_cap(mcaps.get(t)),
                     "Current Price": current,
                     "52W High": high52,
                     "52W Low": low52,
@@ -270,6 +279,19 @@ if st.button("Fetch Earnings"):
         progress = st.progress(0.0)
         final_rows = fetch_all(tickers, progress)
         df_result = pd.DataFrame(final_rows)
-        st.dataframe(df_result, use_container_width=True)
-
-
+        
+        # --- APPLY PERCENTAGE FORMATTING ---
+        pct_cols = [
+            "Δ vs 52W High %", "Δ vs 52W Low %", 
+            "1D Reaction %", "3D Reaction %"
+        ]
+        
+        # Use Streamlit's column config for clean number formatting
+        st.dataframe(
+            df_result, 
+            use_container_width=True,
+            column_config={
+                col: st.column_config.NumberColumn(format="%.2f%%") 
+                for col in pct_cols
+            }
+        )
