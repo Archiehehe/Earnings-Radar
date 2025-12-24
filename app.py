@@ -30,13 +30,9 @@ def pct(a, b):
 
 
 # =========================
-# FINNHUB (FIXED)
+# FINNHUB
 # =========================
 def finnhub_next_earnings(ticker, lookahead_days):
-    """
-    Finnhub calendar endpoint ONLY works with from/to dates.
-    Symbol filtering must be done manually.
-    """
     try:
         today = datetime.utcnow().date()
         end = today + timedelta(days=lookahead_days)
@@ -174,10 +170,10 @@ def fetch_all(tickers, lookahead_days, progress):
 # =========================
 st.title("📅 Earnings Calendar Tracker")
 
-# ---- INPUTS ----
+# ---- UPLOAD FILES ----
 uploaded_files = st.file_uploader(
-    "Upload CSV files (must contain a 'Ticker' column)",
-    type=["csv"],
+    "Upload CSV or Excel files (Ticker column required)",
+    type=["csv", "xlsx", "xls"],
     accept_multiple_files=True,
 )
 
@@ -194,9 +190,17 @@ tickers = set()
 if uploaded_files:
     for f in uploaded_files:
         try:
-            df = pd.read_csv(f)
-            if "Ticker" in df.columns:
-                tickers.update(df["Ticker"].dropna().astype(str).str.upper())
+            if f.name.lower().endswith(".csv"):
+                df = pd.read_csv(f)
+            else:
+                df = pd.read_excel(f)
+
+            for col in ["Ticker", "Symbol", "ticker", "symbol"]:
+                if col in df.columns:
+                    tickers.update(
+                        df[col].dropna().astype(str).str.upper()
+                    )
+                    break
         except Exception:
             st.warning(f"Could not read {f.name}")
 
