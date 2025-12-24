@@ -50,7 +50,6 @@ def format_market_cap(val):
 # NEXT EARNINGS (MULTIPLE METHODS)
 # =========================
 def get_next_earnings_yahoo_scrape(ticker):
-    """Scrape next earnings from Yahoo Finance page"""
     try:
         url = f"https://finance.yahoo.com/quote/{ticker}"
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -61,81 +60,70 @@ def get_next_earnings_yahoo_scrape(ticker):
             date_pattern = r'(\w{3}\s+\d{1,2},\s+\d{4})'
             match = re.search(date_pattern, text)
             if match:
-                date_str = match.group(1)
-                dt = pd.to_datetime(date_str).date()
-                if is_future(dt):
-                    return dt
-    except Exception:
-        pass
-    return None
-
-def get_next_earnings_yf_info(ticker):
-    """Try yfinance info method"""
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        for field in ['earningsDate', 'earningsTimestamp', 'nextEarningsDate']:
-            if field in info and info[field]:
-                date_val = info[field][0] if isinstance(info[field], list) else info[field]
-                dt = pd.to_datetime(date_val, unit='s' if isinstance(date_val, (int, float)) else None).date()
-                if is_future(dt):
-                    return dt
-    except Exception:
-        pass
+                dt = pd.to_datetime(match.group(1)).date()
+                if is_future(dt): return dt
+    except: pass
     return None
 
 def get_next_earnings_yf_calendar(ticker):
-    """Try yfinance calendar"""
     try:
         stock = yf.Ticker(ticker)
         cal = stock.calendar
         if cal is not None and not cal.empty:
             if 'Earnings Date' in cal.index:
                 dates = cal.loc['Earnings Date']
-                if isinstance(dates, (list, pd.Series)):
+                if isinstance(dates, (list, pd.Series, pd.Index)):
                     for d in dates:
                         dt = pd.to_datetime(d).date()
-                        if is_future(dt):
-                            return dt
+                        if is_future(dt): return dt
                 else:
                     dt = pd.to_datetime(dates).date()
-                    if is_future(dt):
-                        return dt
-    except Exception:
-        pass
-    return None
-
-def get_next_earnings_fmp(ticker):
-    """Try Financial Modeling Prep API"""
-    try:
-        url = f"https://financialmodelingprep.com/api/v3/earning_calendar?symbol={ticker}"
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        if data:
-            dt = pd.to_datetime(data[0].get('date')).date()
-            if is_future(dt):
-                return dt
-    except Exception:
-        pass
+                    if is_future(dt): return dt
+    except: pass
     return None
 
 def get_next_earnings(ticker):
-    """Try multiple methods and force a future date"""
-    methods = [
-        get_next_earnings_yf_calendar,
-        get_next_earnings_yf_info,
-        get_next_earnings_fmp,
-        get_next_earnings_yahoo_scrape,
-    ]
-    
+    methods = [get_next_earnings_yf_calendar, get_next_earnings_yahoo_scrape]
     for method in methods:
         result = method(ticker)
-        if result and is_future(result):
-            return result
+        if result: return result
     return "TBD"
 
 # =========================
-# FINNHUB (PAST EARNINGS)
+# REACTIONS (FIXED FOR TRADING DAYS)
+# =========================
+def reaction(price_df, earnings_date, days_after):
+    """
+    Finds the reaction after earnings by strictly using the next 
+    available trading days, skipping weekends and holidays.
+    """
+    try:
+        # 1. Normalize dates to compare without time
+        price_df.index = pd.to_datetime(price_df.index).normalize()
+        e_date = pd.to_datetime(earnings_date).normalize()
+        
+        # 2. Get the 'Pre-Earnings' price (last close on or before earnings date)
+        pre_data = price_df.loc[:e_date]
+        if pre_data.empty:
+            return None
+        pre_close = pre_data.iloc[-1]["Close"]
+        
+        # 3. Get all trading days strictly AFTER the earnings date
+        post_data = price_df.loc[e_date + timedelta(days=1):]
+        if post_data.empty:
+            return None
+            
+        # 4. Pick the Nth available trading day (e.g., 1st or 3rd)
+        # If we ask for 3 days but only have 2, take the latest available
+        idx = min(days_after - 1, len(post_data) - 1)
+        post_close = post_data.iloc[idx]["Close"]
+        
+        return pct(post_close, pre_close)
+    except Exception:
+        return None
+
+# =========================
+# DATA FETCHING
 # =========================
 def finnhub_past_earnings(ticker, limit=4):
     try:
@@ -145,79 +133,42 @@ def finnhub_past_earnings(ticker, limit=4):
         if not df.empty:
             df["date"] = pd.to_datetime(df["period"])
             return df
-    except Exception:
-        pass
+    except: pass
     return pd.DataFrame()
 
-# =========================
-# YFINANCE (CACHED)
-# =========================
 @st.cache_data(ttl=3600)
 def yf_prices(tickers, period):
-    return yf.download(
-        tickers=tickers,
-        period=period,
-        interval="1d",
-        group_by="ticker",
-        threads=True,
-        progress=False,
-    )
+    return yf.download(tickers=tickers, period=period, group_by="ticker", progress=False)
 
 def market_cap(ticker):
     try:
         fi = yf.Ticker(ticker).fast_info
         return safe_float(fi.get("market_cap") or fi.get("marketCap"))
-    except Exception:
-        return None
+    except: return None
 
-def reaction(price_df, date, trading_days):
-    try:
-        d = pd.to_datetime(date).normalize()
-        pre_data = price_df.loc[:d]
-        if pre_data.empty: return None
-        pre = pre_data.iloc[-1]["Close"]
-        
-        post_data = price_df.loc[d + timedelta(days=1):]
-        if post_data.empty: return None
-        
-        idx = min(trading_days - 1, len(post_data) - 1)
-        post = post_data.iloc[idx]["Close"]
-        return pct(post, pre)
-    except Exception:
-        return None
-
-# =========================
-# MAIN FETCH
-# =========================
 def fetch_all(tickers, progress):
     rows = []
-    prices_1y = yf_prices(tickers, "1y")
     prices_2y = yf_prices(tickers, "2y")
-
+    
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
         mcaps = dict(zip(tickers, ex.map(market_cap, tickers)))
-
-    with ThreadPoolExecutor(MAX_WORKERS) as ex:
-        futures = {ex.submit(get_next_earnings, t): t for t in tickers}
-        next_earn = {futures[f]: f.result() for f in as_completed(futures)}
-
-    with ThreadPoolExecutor(MAX_WORKERS) as ex:
-        futures = {ex.submit(finnhub_past_earnings, t): t for t in tickers}
-        past_earn = {futures[f]: f.result() for f in as_completed(futures)}
+        next_earn = {t: ex.submit(get_next_earnings, t) for t in tickers}
+        past_earn = {t: ex.submit(finnhub_past_earnings, t) for t in tickers}
 
     for i, t in enumerate(tickers):
         try:
-            p1 = prices_1y[t] if len(tickers) > 1 else prices_1y
+            # Handle single vs multi-ticker dataframe structure
             p2 = prices_2y[t] if len(tickers) > 1 else prices_2y
+            
+            current = safe_float(p2["Close"].iloc[-1])
+            high52 = safe_float(p2["High"].iloc[-252:].max()) # Approx 1yr of trading
+            low52 = safe_float(p2["Low"].iloc[-252:].min())
 
-            current = safe_float(p1["Close"].iloc[-1])
-            high52 = safe_float(p1["High"].max())
-            low52 = safe_float(p1["Low"].min())
-
+            df_past = past_earn[t].result()
             earn_rows = []
-            df = past_earn.get(t, pd.DataFrame())
-            if not df.empty:
-                for _, r in df.iterrows():
+            
+            if not df_past.empty:
+                for _, r in df_past.iterrows():
                     earn_rows.append({
                         "Date": r["date"].date(),
                         "EPS Actual": r.get("actual"),
@@ -226,12 +177,8 @@ def fetch_all(tickers, progress):
                         "1D Reaction %": reaction(p2, r["date"], 1),
                         "3D Reaction %": reaction(p2, r["date"], 3),
                     })
-            
-            if not earn_rows:
-                earn_rows.append({
-                    "Date": None, "EPS Actual": None, "EPS Est.": None,
-                    "Surprise": None, "1D Reaction %": None, "3D Reaction %": None
-                })
+            else:
+                earn_rows.append({"Date": None, "EPS Actual": None, "EPS Est.": None, "Surprise": None, "1D Reaction %": None, "3D Reaction %": None})
 
             for e in earn_rows:
                 rows.append({
@@ -242,11 +189,10 @@ def fetch_all(tickers, progress):
                     "52W Low": low52,
                     "Δ vs 52W High %": pct(current, high52),
                     "Δ vs 52W Low %": pct(current, low52),
-                    "Next Earnings": next_earn.get(t),
+                    "Next Earnings": next_earn[t].result(),
                     **e
                 })
-        except Exception:
-            rows.append({"Ticker": t})
+        except: rows.append({"Ticker": t})
         progress.progress((i + 1) / len(tickers))
     return rows
 
@@ -255,22 +201,8 @@ def fetch_all(tickers, progress):
 # =========================
 st.title("📊 Earnings Radar")
 
-uploaded_files = st.file_uploader("Upload CSV or Excel files", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
 tickers_text = st.text_area("Enter tickers", "AAPL\nMSFT\nNVDA\nGOOGL")
-
-tickers = set()
-if uploaded_files:
-    for f in uploaded_files:
-        try:
-            df = pd.read_csv(f) if f.name.endswith(".csv") else pd.read_excel(f)
-            for col in ["Ticker", "Symbol", "ticker", "symbol"]:
-                if col in df.columns:
-                    tickers.update(df[col].dropna().astype(str).str.upper())
-                    break
-        except: st.warning(f"Could not read {f.name}")
-
-tickers.update(t.strip().upper() for t in tickers_text.replace(",", "\n").split() if t.strip())
-tickers = sorted(tickers)
+tickers = sorted(set(t.strip().upper() for t in tickers_text.replace(",", "\n").split() if t.strip()))
 
 if st.button("Fetch Earnings"):
     if not tickers:
@@ -280,18 +212,9 @@ if st.button("Fetch Earnings"):
         final_rows = fetch_all(tickers, progress)
         df_result = pd.DataFrame(final_rows)
         
-        # --- APPLY PERCENTAGE FORMATTING ---
-        pct_cols = [
-            "Δ vs 52W High %", "Δ vs 52W Low %", 
-            "1D Reaction %", "3D Reaction %"
-        ]
-        
-        # Use Streamlit's column config for clean number formatting
+        pct_cols = ["Δ vs 52W High %", "Δ vs 52W Low %", "1D Reaction %", "3D Reaction %"]
         st.dataframe(
             df_result, 
             use_container_width=True,
-            column_config={
-                col: st.column_config.NumberColumn(format="%.2f%%") 
-                for col in pct_cols
-            }
+            column_config={col: st.column_config.NumberColumn(format="%.2f%%") for col in pct_cols}
         )
