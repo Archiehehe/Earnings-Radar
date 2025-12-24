@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import yfinance as yf
 import requests
 from datetime import datetime, timedelta
@@ -12,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 FINNHUB_API_KEY = st.secrets.get("FINNHUB_API_KEY", "")
 MAX_WORKERS = 8
 
-st.set_page_config(page_title="Earnings Calendar", layout="wide")
+st.set_page_config(page_title="Earnings Calendar Tracker", layout="wide")
 
 # =========================
 # HELPERS
@@ -31,18 +30,29 @@ def pct(a, b):
 
 
 # =========================
-# FINNHUB
+# FINNHUB (FIXED)
 # =========================
-def finnhub_next_earnings(ticker, lookahead_days=90):
+def finnhub_next_earnings(ticker, lookahead_days):
+    """
+    Finnhub calendar endpoint ONLY works with from/to dates.
+    Symbol filtering must be done manually.
+    """
     try:
-        url = f"https://finnhub.io/api/v1/calendar/earnings?symbol={ticker}&token={FINNHUB_API_KEY}"
+        today = datetime.utcnow().date()
+        end = today + timedelta(days=lookahead_days)
+
+        url = (
+            "https://finnhub.io/api/v1/calendar/earnings"
+            f"?from={today}&to={end}&token={FINNHUB_API_KEY}"
+        )
         r = requests.get(url, timeout=10).json()
+
         for e in r.get("earningsCalendar", []):
-            d = pd.to_datetime(e["date"])
-            if d >= pd.Timestamp.today() and d <= pd.Timestamp.today() + pd.Timedelta(days=lookahead_days):
-                return d.date()
+            if e.get("symbol") == ticker:
+                return pd.to_datetime(e["date"]).date()
     except Exception:
         pass
+
     return None
 
 
@@ -104,14 +114,16 @@ def fetch_all(tickers, lookahead_days, progress):
     prices_1y = yf_prices(tickers, "1y")
     prices_2y = yf_prices(tickers, "2y")
 
-    # market caps in parallel
+    # Market caps (parallel)
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
         mcaps = dict(zip(tickers, ex.map(market_cap, tickers)))
 
+    # Next earnings (parallel)
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
         futures = {ex.submit(finnhub_next_earnings, t, lookahead_days): t for t in tickers}
         next_earn = {futures[f]: f.result() for f in as_completed(futures)}
 
+    # Past earnings (parallel)
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
         futures = {ex.submit(finnhub_past_earnings, t): t for t in tickers}
         past_earn = {futures[f]: f.result() for f in as_completed(futures)}
@@ -162,30 +174,59 @@ def fetch_all(tickers, lookahead_days, progress):
 # =========================
 st.title("📅 Earnings Calendar Tracker")
 
-tickers_input = st.text_area(
+# ---- INPUTS ----
+uploaded_files = st.file_uploader(
+    "Upload CSV files (must contain a 'Ticker' column)",
+    type=["csv"],
+    accept_multiple_files=True,
+)
+
+tickers_text = st.text_area(
     "Enter tickers (comma or newline separated)",
-    "AAPL\nMSFT\nNVDA\nGOOGL"
+    "AAPL\nMSFT\nNVDA\nGOOGL",
 )
 
 lookahead_days = st.slider("Lookahead days", 30, 180, 90)
 
+# ---- PARSE TICKERS ----
+tickers = set()
+
+if uploaded_files:
+    for f in uploaded_files:
+        try:
+            df = pd.read_csv(f)
+            if "Ticker" in df.columns:
+                tickers.update(df["Ticker"].dropna().astype(str).str.upper())
+        except Exception:
+            st.warning(f"Could not read {f.name}")
+
+tickers.update(
+    t.strip().upper()
+    for t in tickers_text.replace(",", "\n").split()
+    if t.strip()
+)
+
+tickers = sorted(tickers)
+
+# ---- RUN ----
 if st.button("Fetch Earnings"):
-    tickers = sorted({t.strip().upper() for t in tickers_input.replace(",", "\n").split() if t.strip()})
-    progress = st.progress(0.0)
+    if not tickers:
+        st.warning("No tickers provided")
+    else:
+        progress = st.progress(0.0)
+        data = fetch_all(tickers, lookahead_days, progress)
 
-    data = fetch_all(tickers, lookahead_days, progress)
+        # Flatten earnings rows
+        rows = []
+        for r in data:
+            if not r.get("Earnings"):
+                rows.append(r)
+            else:
+                for e in r["Earnings"]:
+                    row = r.copy()
+                    row.update(e)
+                    row.pop("Earnings", None)
+                    rows.append(row)
 
-    # flatten earnings
-    rows = []
-    for r in data:
-        if not r.get("Earnings"):
-            rows.append(r)
-        else:
-            for e in r["Earnings"]:
-                row = r.copy()
-                row.update(e)
-                row.pop("Earnings", None)
-                rows.append(row)
-
-    df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True)
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True)
