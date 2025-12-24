@@ -52,16 +52,19 @@ def finnhub_past_earnings(ticker, limit=4):
 
 
 # =========================
-# NEXT EARNINGS (YAHOO FALLBACK)
+# NEXT EARNINGS (Finnhub)
 # =========================
-def next_earnings_yahoo(ticker):
+def finnhub_next_earnings(ticker, lookahead_days=90):
     try:
-        cal = yf.Ticker(ticker).calendar
-        if isinstance(cal, pd.DataFrame) and not cal.empty:
-            d = cal.loc["Earnings Date"].iloc[0]
-            return pd.to_datetime(d).date()
+        today = datetime.utcnow().date()
+        end = today + timedelta(days=lookahead_days)
+        url = f"https://finnhub.io/api/v1/calendar/earnings?from={today}&to={end}&token={FINNHUB_API_KEY}"
+        r = requests.get(url, timeout=10).json()
+        for e in r.get("earningsCalendar", []):
+            if e.get("symbol") == ticker:
+                return pd.to_datetime(e["date"]).date()
     except Exception:
-        pass
+        return None
     return None
 
 
@@ -104,20 +107,23 @@ def reaction(price_df, date, days):
 # =========================
 # MAIN FETCH
 # =========================
-def fetch_all(tickers, progress):
+def fetch_all(tickers, lookahead_days, progress):
     rows = []
 
     prices_1y = yf_prices(tickers, "1y")
     prices_2y = yf_prices(tickers, "2y")
 
+    # Market cap (parallel)
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
         mcaps = dict(zip(tickers, ex.map(market_cap, tickers)))
 
+    # Past earnings (parallel)
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
         past = dict(zip(tickers, ex.map(finnhub_past_earnings, tickers)))
 
+    # Next earnings (parallel)
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
-        next_e = dict(zip(tickers, ex.map(next_earnings_yahoo, tickers)))
+        next_earn = dict(zip(tickers, ex.map(lambda t: finnhub_next_earnings(t, lookahead_days), tickers)))
 
     for i, t in enumerate(tickers):
         try:
@@ -139,7 +145,7 @@ def fetch_all(tickers, progress):
                     "52W Low": round(low52, 2),
                     "Δ vs 52W High %": pct(current, high52),
                     "Δ vs 52W Low %": pct(current, low52),
-                    "Next Earnings": next_e.get(t),
+                    "Next Earnings": next_earn.get(t) or "N/A",
                 })
             else:
                 for _, r in df.iterrows():
@@ -151,7 +157,7 @@ def fetch_all(tickers, progress):
                         "52W Low": round(low52, 2),
                         "Δ vs 52W High %": pct(current, high52),
                         "Δ vs 52W Low %": pct(current, low52),
-                        "Next Earnings": next_e.get(t),
+                        "Next Earnings": next_earn.get(t) or "N/A",
                         "Earnings Date": r["date"].date(),
                         "EPS Actual": r.get("actual"),
                         "EPS Est.": r.get("estimate"),
@@ -181,19 +187,27 @@ uploaded_files = st.file_uploader(
 
 text = st.text_area("Enter tickers", "AAPL\nMSFT\nNVDA\nGOOGL")
 
+lookahead_days = st.slider("Lookahead days", 30, 180, 90)
+
 tickers = set()
 
 if uploaded_files:
     for f in uploaded_files:
-        df = pd.read_excel(f) if f.name.endswith(("xls", "xlsx")) else pd.read_csv(f)
-        for c in ["Ticker", "Symbol", "ticker", "symbol"]:
-            if c in df.columns:
-                tickers.update(df[c].dropna().astype(str).str.upper())
+        try:
+            df = pd.read_excel(f) if f.name.endswith(("xls", "xlsx")) else pd.read_csv(f)
+            for c in ["Ticker", "Symbol", "ticker", "symbol"]:
+                if c in df.columns:
+                    tickers.update(df[c].dropna().astype(str).str.upper())
+        except Exception:
+            st.warning(f"Could not read {f.name}")
 
 tickers.update(t.strip().upper() for t in text.replace(",", "\n").split() if t.strip())
 tickers = sorted(tickers)
 
 if st.button("Fetch Earnings"):
-    progress = st.progress(0.0)
-    data = fetch_all(tickers, progress)
-    st.dataframe(pd.DataFrame(data), use_container_width=True)
+    if not tickers:
+        st.warning("No tickers provided")
+    else:
+        progress = st.progress(0.0)
+        data = fetch_all(tickers, lookahead_days, progress)
+        st.dataframe(pd.DataFrame(data), use_container_width=True)
