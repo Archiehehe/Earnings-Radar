@@ -342,7 +342,9 @@ if st.button("Fetch Earnings"):
         rows = []
         for r in data:
             if not r.get("Earnings"):
-                rows.append(r)
+                # Remove Earnings key from rows without historical data
+                clean_row = {k: v for k, v in r.items() if k != "Earnings"}
+                rows.append(clean_row)
             else:
                 for e in r["Earnings"]:
                     row = r.copy()
