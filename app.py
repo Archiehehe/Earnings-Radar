@@ -321,7 +321,6 @@ if st.button("Fetch Earnings", type="primary"):
             st.subheader("Earnings Report")
             st.dataframe(
                 df_result, 
-                use_container_width=True,
                 hide_index=True,
                 column_config=column_config
             )
