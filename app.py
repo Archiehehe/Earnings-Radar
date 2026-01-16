@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 FINNHUB_API_KEY = st.secrets.get("FINNHUB_API_KEY", "")
 MAX_WORKERS = 8
 
-st.set_page_config(page_title="Earnings Radar", layout="wide")
+st.set_page_config(page_title="Earnings Radar", layout="wide", page_icon="📊")
 
 # =========================
 # HELPERS
@@ -252,12 +252,22 @@ def fetch_all(tickers, progress):
     return rows
 
 # =========================
-# UI
+# UI IMPROVEMENTS
 # =========================
-st.title("📊 Earnings Radar")
+# Sidebar for inputs
+with st.sidebar:
+    st.header("Portfolio Input")
+    uploaded_files = st.file_uploader("Upload CSV or Excel files", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
+    tickers_text = st.text_area("Or enter tickers (one per line)", "AAPL\nMSFT\nNVDA\nGOOGL")
+    
+    st.divider()
+    st.markdown("**About Earnings Radar**")
+    st.markdown("Track upcoming earnings and historical reactions for your stocks. Built with Streamlit and yfinance.")
+    st.markdown("[GitHub Repo](https://github.com/Archiehehe/earnings)")
 
-uploaded_files = st.file_uploader("Upload CSV or Excel files", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
-tickers_text = st.text_area("Enter tickers", "AAPL\nMSFT\nNVDA\nGOOGL")
+# Main content
+st.title("📊 Earnings Radar")
+st.markdown("Upload your portfolio or enter tickers to view upcoming earnings calendars and historical market reactions.")
 
 tickers = set()
 if uploaded_files:
@@ -268,49 +278,73 @@ if uploaded_files:
                 if col in df.columns:
                     tickers.update(df[col].dropna().astype(str).str.upper())
                     break
-        except: st.warning(f"Could not read {f.name}")
+        except:
+            st.warning(f"Could not read {f.name}")
 
 tickers.update(t.strip().upper() for t in tickers_text.replace(",", "\n").split() if t.strip())
 tickers = sorted(tickers)
 
-if st.button("Fetch Earnings"):
+if st.button("Fetch Earnings", type="primary"):
     if not tickers:
         st.warning("No tickers provided")
     else:
-        progress = st.progress(0.0)
-        final_rows = fetch_all(tickers, progress)
-        df_result = pd.DataFrame(final_rows)
-        
-        # --- APPLY PERCENTAGE FORMATTING ---
-        pct_cols = [
-            "Δ vs 52W High %", "Δ vs 52W Low %", 
-            "1D Reaction %", "3D Reaction %"
-        ]
-        
-        # Use Streamlit's column config for clean number formatting
-        st.dataframe(
-            df_result, 
-            use_container_width=True,
-            column_config={
+        with st.spinner("Fetching data... This may take a moment."):
+            progress = st.progress(0.0)
+            final_rows = fetch_all(tickers, progress)
+            df_result = pd.DataFrame(final_rows)
+            
+            # Sort by Ticker and Date descending
+            df_result = df_result.sort_values(["Ticker", "Date"], ascending=[True, False])
+            
+            # --- APPLY PERCENTAGE FORMATTING ---
+            pct_cols = [
+                "Δ vs 52W High %", "Δ vs 52W Low %", 
+                "1D Reaction %", "3D Reaction %"
+            ]
+            
+            # Column configs for better display
+            column_config = {
                 col: st.column_config.NumberColumn(format="%.2f%%") 
                 for col in pct_cols
             }
-        )
-
-        # --- EXPORT TO EXCEL ---
-        st.divider()
-        
-        # Create a buffer for the Excel file
-        buffer = io.BytesIO()
-        
-        # Use xlsxwriter to handle the Excel creation in memory
-        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-            df_result.to_excel(writer, index=False, sheet_name='Earnings_Report')
+            column_config.update({
+                "Current Price": st.column_config.NumberColumn(format="$%.2f"),
+                "52W High": st.column_config.NumberColumn(format="$%.2f"),
+                "52W Low": st.column_config.NumberColumn(format="$%.2f"),
+                "EPS Actual": st.column_config.NumberColumn(format="%.4f"),
+                "EPS Est.": st.column_config.NumberColumn(format="%.4f"),
+                "Surprise": st.column_config.NumberColumn(format="%.4f"),
+                "Next Earnings": st.column_config.DateColumn(format="YYYY-MM-DD"),
+                "Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
+            })
             
-        # Download button appears after dataframe generation
-        st.download_button(
-            label="📥 Download Results as Excel",
-            data=buffer.getvalue(),
-            file_name=f"earnings_radar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+            st.subheader("Earnings Report")
+            st.dataframe(
+                df_result, 
+                use_container_width=True,
+                hide_index=True,
+                column_config=column_config
+            )
+
+            # --- EXPORT TO EXCEL ---
+            st.divider()
+            
+            # Create a buffer for the Excel file
+            buffer = io.BytesIO()
+            
+            # Use openpyxl instead of xlsxwriter to avoid ModuleNotFoundError
+            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                df_result.to_excel(writer, index=False, sheet_name='Earnings_Report')
+            
+            # Download button
+            st.download_button(
+                label="📥 Download Results as Excel",
+                data=buffer,
+                file_name=f"earnings_radar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="secondary"
+            )
+
+# Additional UI polish: Footer
+st.divider()
+st.markdown("Powered by yfinance, Finnhub, and Streamlit. Data may have delays or inaccuracies – always verify with official sources.")
