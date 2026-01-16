@@ -5,18 +5,32 @@ import requests
 import io
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from bs4 import BeautifulSoup
 
 # =========================
-# CONFIG
+# ⚙️ CONFIGURATION & STYLE
 # =========================
+st.set_page_config(
+    page_title="Earnings Radar",
+    page_icon="📡",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS for a modern look
+st.markdown("""
+    <style>
+    .stApp { background-color: #0e1117; color: #fafafa; }
+    div.stButton > button { width: 100%; border-radius: 8px; font-weight: bold; }
+    [data-testid="stMetricValue"] { font-size: 1.5rem; }
+    </style>
+""", unsafe_allow_html=True)
+
+# API Keys
 FINNHUB_API_KEY = st.secrets.get("FINNHUB_API_KEY", "")
 MAX_WORKERS = 8
 
-st.set_page_config(page_title="Earnings Radar", layout="wide")
-
 # =========================
-# HELPERS
+# 🛠️ HELPER FUNCTIONS
 # =========================
 def safe_float(x):
     try:
@@ -30,287 +44,307 @@ def pct(a, b):
     return (a - b) / b * 100
 
 def is_future(date_obj):
-    """Check if a date is today or in the future"""
     if date_obj is None:
         return False
     return date_obj >= datetime.now().date()
 
 def format_market_cap(val):
-    """Truncate large market cap numbers to M, B, or T"""
     if val is None or not isinstance(val, (int, float)):
         return "N/A"
     if val >= 1e12:
-        return f"{val / 1e12:.2f}T"
+        return f"${val / 1e12:.2f}T"
     elif val >= 1e9:
-        return f"{val / 1e9:.2f}B"
+        return f"${val / 1e9:.2f}B"
     elif val >= 1e6:
-        return f"{val / 1e6:.2f}M"
-    return f"{val:.2f}"
+        return f"${val / 1e6:.2f}M"
+    return f"${val:.2f}"
+
+def format_percentage(val):
+    if val is None:
+        return "-"
+    color = "green" if val >= 0 else "red"
+    return f":{color}[{val:.2f}%]"
 
 # =========================
-# NEXT EARNINGS (MULTIPLE METHODS)
+# 📅 EARNINGS DATE FETCHERS
 # =========================
 def get_next_earnings_yahoo_scrape(ticker):
-    """Scrape next earnings from Yahoo Finance page"""
     try:
         url = f"https://finance.yahoo.com/quote/{ticker}"
         headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=5)
         text = response.text
         if 'Earnings Date' in text:
             import re
-            date_pattern = r'(\w{3}\s+\d{1,2},\s+\d{4})'
-            match = re.search(date_pattern, text)
+            match = re.search(r'(\w{3}\s+\d{1,2},\s+\d{4})', text)
             if match:
-                date_str = match.group(1)
-                dt = pd.to_datetime(date_str).date()
-                if is_future(dt):
-                    return dt
-    except Exception:
-        pass
-    return None
-
-def get_next_earnings_yf_info(ticker):
-    """Try yfinance info method"""
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        for field in ['earningsDate', 'earningsTimestamp', 'nextEarningsDate']:
-            if field in info and info[field]:
-                date_val = info[field][0] if isinstance(info[field], list) else info[field]
-                dt = pd.to_datetime(date_val, unit='s' if isinstance(date_val, (int, float)) else None).date()
-                if is_future(dt):
-                    return dt
-    except Exception:
-        pass
+                dt = pd.to_datetime(match.group(1)).date()
+                if is_future(dt): return dt
+    except: pass
     return None
 
 def get_next_earnings_yf_calendar(ticker):
-    """Try yfinance calendar"""
     try:
         stock = yf.Ticker(ticker)
         cal = stock.calendar
         if cal is not None and not cal.empty:
-            if 'Earnings Date' in cal.index:
-                dates = cal.loc['Earnings Date']
+            dates = cal.loc['Earnings Date'] if 'Earnings Date' in cal.index else None
+            if dates is not None:
+                # Handle both single date and list of dates
                 if isinstance(dates, (list, pd.Series)):
-                    for d in dates:
-                        dt = pd.to_datetime(d).date()
-                        if is_future(dt):
-                            return dt
-                else:
-                    dt = pd.to_datetime(dates).date()
-                    if is_future(dt):
-                        return dt
-    except Exception:
-        pass
-    return None
-
-def get_next_earnings_fmp(ticker):
-    """Try Financial Modeling Prep API"""
-    try:
-        url = f"https://financialmodelingprep.com/api/v3/earning_calendar?symbol={ticker}"
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        if data:
-            dt = pd.to_datetime(data[0].get('date')).date()
-            if is_future(dt):
-                return dt
-    except Exception:
-        pass
+                    dates = dates[0]
+                dt = pd.to_datetime(dates).date()
+                if is_future(dt): return dt
+    except: pass
     return None
 
 def get_next_earnings(ticker):
-    """Try multiple methods and force a future date"""
-    methods = [
-        get_next_earnings_yf_calendar,
-        get_next_earnings_yf_info,
-        get_next_earnings_fmp,
-        get_next_earnings_yahoo_scrape,
-    ]
-    
+    # Try methods in order of reliability/speed
+    methods = [get_next_earnings_yf_calendar, get_next_earnings_yahoo_scrape]
     for method in methods:
-        result = method(ticker)
-        if result and is_future(result):
-            return result
+        res = method(ticker)
+        if res: return res
     return "TBD"
 
 # =========================
-# FINNHUB (PAST EARNINGS)
+# 📉 HISTORICAL DATA
 # =========================
 def finnhub_past_earnings(ticker, limit=4):
     try:
         url = f"https://finnhub.io/api/v1/stock/earnings?symbol={ticker}&token={FINNHUB_API_KEY}"
-        r = requests.get(url, timeout=10).json()
-        df = pd.DataFrame(r[:limit])
-        if not df.empty:
-            df["date"] = pd.to_datetime(df["period"])
-            return df
-    except Exception:
-        pass
+        r = requests.get(url, timeout=5).json()
+        if isinstance(r, list):
+            df = pd.DataFrame(r[:limit])
+            if not df.empty:
+                df["date"] = pd.to_datetime(df["period"])
+                return df
+    except: pass
     return pd.DataFrame()
 
-# =========================
-# YFINANCE (CACHED)
-# =========================
 @st.cache_data(ttl=3600)
-def yf_prices(tickers, period):
-    return yf.download(
-        tickers=tickers,
-        period=period,
-        interval="1d",
-        group_by="ticker",
-        threads=True,
-        progress=False,
-    )
-
-def market_cap(ticker):
+def fetch_market_data(tickers):
+    # Batch fetch prices for efficiency
     try:
-        fi = yf.Ticker(ticker).fast_info
-        return safe_float(fi.get("market_cap") or fi.get("marketCap"))
-    except Exception:
-        return None
+        data_1y = yf.download(tickers, period="1y", group_by='ticker', threads=True, progress=False)
+        data_2y = yf.download(tickers, period="2y", group_by='ticker', threads=True, progress=False)
+        return data_1y, data_2y
+    except Exception as e:
+        return None, None
 
 def reaction(price_df, date, trading_days):
     try:
         d = pd.to_datetime(date).normalize()
+        # Find closest trading day before
         pre_data = price_df.loc[:d]
         if pre_data.empty: return None
         pre = pre_data.iloc[-1]["Close"]
         
+        # Find price N days after
         post_data = price_df.loc[d + timedelta(days=1):]
         if post_data.empty: return None
-        
         idx = min(trading_days - 1, len(post_data) - 1)
         post = post_data.iloc[idx]["Close"]
+        
         return pct(post, pre)
-    except Exception:
-        return None
+    except: return None
 
 # =========================
-# MAIN FETCH
+# 🚀 MAIN LOGIC
 # =========================
-def fetch_all(tickers, progress):
-    rows = []
-    prices_1y = yf_prices(tickers, "1y")
-    prices_2y = yf_prices(tickers, "2y")
-
+def analyze_portfolio(tickers):
+    status = st.status("🚀 Launching Earnings Radar...", expanded=True)
+    
+    # 1. Market Data
+    status.write("📉 Fetching price history...")
+    p1, p2 = fetch_market_data(list(tickers))
+    
+    # 2. Market Caps
+    status.write("💰 Calculating market caps...")
+    mcaps = {}
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
-        mcaps = dict(zip(tickers, ex.map(market_cap, tickers)))
+        futures = {ex.submit(lambda t: yf.Ticker(t).fast_info.market_cap, t): t for t in tickers}
+        for f in as_completed(futures):
+            try: mcaps[futures[f]] = f.result()
+            except: mcaps[futures[f]] = None
 
+    # 3. Next Earnings
+    status.write("📅 Scanning for future earnings dates...")
+    next_earn = {}
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
         futures = {ex.submit(get_next_earnings, t): t for t in tickers}
-        next_earn = {futures[f]: f.result() for f in as_completed(futures)}
+        for f in as_completed(futures):
+            next_earn[futures[f]] = f.result()
 
+    # 4. Past Earnings & Reactions
+    status.write("📊 Analyzing historical reactions...")
+    rows = []
+    
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
         futures = {ex.submit(finnhub_past_earnings, t): t for t in tickers}
-        past_earn = {futures[f]: f.result() for f in as_completed(futures)}
+        past_earn_data = {futures[f]: f.result() for f in as_completed(futures)}
 
-    for i, t in enumerate(tickers):
+    # 5. Assemble Data
+    for t in tickers:
         try:
-            p1 = prices_1y[t] if len(tickers) > 1 else prices_1y
-            p2 = prices_2y[t] if len(tickers) > 1 else prices_2y
+            # Handle Single vs Multi-Index levels from yfinance
+            if len(tickers) > 1:
+                t_p1 = p1[t] if t in p1 else p1
+                t_p2 = p2[t] if t in p2 else p2
+            else:
+                t_p1 = p1
+                t_p2 = p2
 
-            current = safe_float(p1["Close"].iloc[-1])
-            high52 = safe_float(p1["High"].max())
-            low52 = safe_float(p1["Low"].min())
-
+            # Basic Stats
+            current = safe_float(t_p1["Close"].iloc[-1]) if not t_p1.empty else 0
+            high52 = safe_float(t_p1["High"].max()) if not t_p1.empty else 0
+            low52 = safe_float(t_p1["Low"].min()) if not t_p1.empty else 0
+            
+            # Historical Rows
+            hist_df = past_earn_data.get(t, pd.DataFrame())
             earn_rows = []
-            df = past_earn.get(t, pd.DataFrame())
-            if not df.empty:
-                for _, r in df.iterrows():
+            
+            if not hist_df.empty:
+                for _, r in hist_df.iterrows():
                     earn_rows.append({
                         "Date": r["date"].date(),
-                        "EPS Actual": r.get("actual"),
-                        "EPS Est.": r.get("estimate"),
-                        "Surprise": r.get("surprise"),
-                        "1D Reaction %": reaction(p2, r["date"], 1),
-                        "3D Reaction %": reaction(p2, r["date"], 3),
+                        "Surprise %": r.get("surprise"),
+                        "1D Reaction %": reaction(t_p2, r["date"], 1),
+                        "3D Reaction %": reaction(t_p2, r["date"], 3),
                     })
-            
-            if not earn_rows:
-                earn_rows.append({
-                    "Date": None, "EPS Actual": None, "EPS Est.": None,
-                    "Surprise": None, "1D Reaction %": None, "3D Reaction %": None
-                })
+            else:
+                earn_rows.append({"Date": None, "Surprise %": None, "1D Reaction %": None})
 
+            # Create a row for every historical event found
             for e in earn_rows:
                 rows.append({
                     "Ticker": t,
                     "Market Cap": format_market_cap(mcaps.get(t)),
-                    "Current Price": current,
-                    "52W High": high52,
-                    "52W Low": low52,
-                    "Δ vs 52W High %": pct(current, high52),
-                    "Δ vs 52W Low %": pct(current, low52),
-                    "Next Earnings": next_earn.get(t),
+                    "Price": current,
+                    "Next Earnings": next_earn.get(t, "TBD"),
+                    "Near High %": pct(current, high52),
+                    "Near Low %": pct(current, low52),
                     **e
                 })
-        except Exception:
-            rows.append({"Ticker": t})
-        progress.progress((i + 1) / len(tickers))
-    return rows
+        except Exception as e:
+            print(f"Error processing {t}: {e}")
+            rows.append({"Ticker": t, "Next Earnings": "Error"})
+
+    status.update(label="✅ Analysis Complete!", state="complete", expanded=False)
+    return pd.DataFrame(rows)
 
 # =========================
-# UI
+# 🖥️ UI LAYOUT
 # =========================
-st.title("📊 Earnings Radar")
+with st.sidebar:
+    st.header("1. Input Data")
+    uploaded_files = st.file_uploader("📂 Upload Portfolio (CSV/Excel)", accept_multiple_files=True)
+    
+    manual_tickers = st.text_area(
+        "📝 Or Enter Tickers (one per line)", 
+        "AAPL\nNVDA\nMSFT\nAMD\nTSLA",
+        height=150
+    )
+    
+    st.info("💡 Tip: Uploading a CSV with a 'Ticker' column works best!")
 
-uploaded_files = st.file_uploader("Upload CSV or Excel files", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
-tickers_text = st.text_area("Enter tickers", "AAPL\nMSFT\nNVDA\nGOOGL")
-
-tickers = set()
-if uploaded_files:
-    for f in uploaded_files:
-        try:
-            df = pd.read_csv(f) if f.name.endswith(".csv") else pd.read_excel(f)
-            for col in ["Ticker", "Symbol", "ticker", "symbol"]:
-                if col in df.columns:
-                    tickers.update(df[col].dropna().astype(str).str.upper())
-                    break
-        except: st.warning(f"Could not read {f.name}")
-
-tickers.update(t.strip().upper() for t in tickers_text.replace(",", "\n").split() if t.strip())
-tickers = sorted(tickers)
-
-if st.button("Fetch Earnings"):
-    if not tickers:
-        st.warning("No tickers provided")
-    else:
-        progress = st.progress(0.0)
-        final_rows = fetch_all(tickers, progress)
-        df_result = pd.DataFrame(final_rows)
-        
-        # --- APPLY PERCENTAGE FORMATTING ---
-        pct_cols = [
-            "Δ vs 52W High %", "Δ vs 52W Low %", 
-            "1D Reaction %", "3D Reaction %"
-        ]
-        
-        # Use Streamlit's column config for clean number formatting
-        st.dataframe(
-            df_result, 
-            use_container_width=True,
-            column_config={
-                col: st.column_config.NumberColumn(format="%.2f%%") 
-                for col in pct_cols
-            }
-        )
-
-        # --- EXPORT TO EXCEL ---
-        st.divider()
-        
-        # Create a buffer for the Excel file
-        buffer = io.BytesIO()
-        
-        # Use xlsxwriter to handle the Excel creation in memory
-        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-            df_result.to_excel(writer, index=False, sheet_name='Earnings_Report')
+    # Parse Tickers
+    tickers = set()
+    if uploaded_files:
+        for f in uploaded_files:
+            try:
+                df = pd.read_csv(f) if f.name.endswith(".csv") else pd.read_excel(f)
+                cols = [c for c in df.columns if c.lower() in ['ticker', 'symbol']]
+                if cols:
+                    tickers.update(df[cols[0]].astype(str).str.upper().tolist())
+            except: st.error(f"Failed to read {f.name}")
             
-        # Download button appears after dataframe generation
-        st.download_button(
-            label="📥 Download Results as Excel",
-            data=buffer.getvalue(),
-            file_name=f"earnings_radar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    tickers.update([t.strip().upper() for t in manual_tickers.split() if t.strip()])
+    
+    run_btn = st.button("🚀 Analyze Portfolio", type="primary")
+
+# MAIN PAGE
+st.title("📡 Earnings Radar")
+st.markdown("Track upcoming earnings dates and analyze historical price volatility.")
+
+if run_btn and tickers:
+    df_result = analyze_portfolio(sorted(list(tickers)))
+    
+    if not df_result.empty:
+        # === PRE-PROCESSING FOR DISPLAY ===
+        # Fix mixed types for Streamlit/Arrow compatibility
+        df_result["Next Earnings"] = df_result["Next Earnings"].astype(str)
+        
+        # === DASHBOARD STATS ===
+        st.divider()
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Total Tickers", len(tickers))
+        with c2:
+            upcoming = df_result[df_result["Next Earnings"] != "TBD"]["Next Earnings"].nunique()
+            st.metric("Confirmed Dates", upcoming)
+        with c3:
+            avg_move = df_result["1D Reaction %"].abs().mean()
+            st.metric("Avg Volatility (1D)", f"{avg_move:.1f}%" if pd.notnull(avg_move) else "-")
+        with c4:
+            winners = len(df_result[df_result["1D Reaction %"] > 0])
+            st.metric("Positive History", f"{winners} events")
+
+        st.divider()
+
+        # === INTERACTIVE TABLE ===
+        st.subheader("📊 Detailed Analysis")
+        
+        # Configure columns for a beautiful table
+        column_config = {
+            "Ticker": st.column_config.TextColumn("Symbol", width="small"),
+            "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
+            "Next Earnings": st.column_config.TextColumn("Next Event", help="Projected or confirmed date"),
+            "1D Reaction %": st.column_config.NumberColumn(
+                "1D Move", 
+                format="%.2f%%",
+                help="Price change 1 day after earnings"
+            ),
+            "3D Reaction %": st.column_config.NumberColumn(
+                "3D Move", 
+                format="%.2f%%"
+            ),
+            "Surprise %": st.column_config.NumberColumn(
+                "Surprise", 
+                format="%.2f%%"
+            ),
+            "Near High %": st.column_config.ProgressColumn(
+                "vs 52W High", 
+                format="%.0f%%", 
+                min_value=-100, max_value=0
+            ),
+        }
+
+        st.dataframe(
+            df_result,
+            use_container_width=True, # Using standard width param
+            column_config=column_config,
+            height=600,
+            hide_index=True
         )
+
+        # === EXPORT ===
+        st.divider()
+        buffer = io.BytesIO()
+        # FIXED: Using openpyxl explicitly to avoid crashes
+        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+            df_result.to_excel(writer, index=False, sheet_name='Earnings Radar')
+            
+        st.download_button(
+            label="📥 Download Report (Excel)",
+            data=buffer.getvalue(),
+            file_name=f"Earnings_Radar_{datetime.now().strftime('%Y-%m-%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary"
+        )
+    else:
+        st.warning("No data found. Please check your tickers.")
+elif run_btn and not tickers:
+    st.warning("Please enter at least one ticker symbol.")
+else:
+    # Empty State
+    st.info("👈 Add tickers in the sidebar to get started!")
