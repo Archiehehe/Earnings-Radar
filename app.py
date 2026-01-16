@@ -6,15 +6,14 @@ import io
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
-import time
 
 # =========================
 # CONFIG
 # =========================
 FINNHUB_API_KEY = st.secrets.get("FINNHUB_API_KEY", "")
-MAX_WORKERS = 4
+MAX_WORKERS = 8
 
-st.set_page_config(page_title="Earnings Radar", layout="wide", page_icon="📊")
+st.set_page_config(page_title="Earnings Radar", layout="wide")
 
 # =========================
 # HELPERS
@@ -134,7 +133,6 @@ def get_next_earnings(ticker):
         result = method(ticker)
         if result and is_future(result):
             return result
-        time.sleep(0.5)
     return "TBD"
 
 # =========================
@@ -157,17 +155,14 @@ def finnhub_past_earnings(ticker, limit=4):
 # =========================
 @st.cache_data(ttl=3600)
 def yf_prices(tickers, period):
-    try:
-        return yf.download(
-            tickers=tickers,
-            period=period,
-            interval="1d",
-            group_by="ticker",
-            threads=True,
-            progress=False,
-        )
-    except Exception:
-        return pd.DataFrame()
+    return yf.download(
+        tickers=tickers,
+        period=period,
+        interval="1d",
+        group_by="ticker",
+        threads=True,
+        progress=False,
+    )
 
 def market_cap(ticker):
     try:
@@ -200,19 +195,14 @@ def fetch_all(tickers, progress):
     prices_1y = yf_prices(tickers, "1y")
     prices_2y = yf_prices(tickers, "2y")
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+    with ThreadPoolExecutor(MAX_WORKERS) as ex:
         mcaps = dict(zip(tickers, ex.map(market_cap, tickers)))
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+    with ThreadPoolExecutor(MAX_WORKERS) as ex:
         futures = {ex.submit(get_next_earnings, t): t for t in tickers}
-        next_earn = {}
-        for f in as_completed(futures):
-            try:
-                next_earn[futures[f]] = f.result()
-            except Exception:
-                next_earn[futures[f]] = "TBD"
+        next_earn = {futures[f]: f.result() for f in as_completed(futures)}
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+    with ThreadPoolExecutor(MAX_WORKERS) as ex:
         futures = {ex.submit(finnhub_past_earnings, t): t for t in tickers}
         past_earn = {futures[f]: f.result() for f in as_completed(futures)}
 
@@ -221,9 +211,9 @@ def fetch_all(tickers, progress):
             p1 = prices_1y[t] if len(tickers) > 1 else prices_1y
             p2 = prices_2y[t] if len(tickers) > 1 else prices_2y
 
-            current = safe_float(p1["Close"].iloc[-1]) if not p1.empty else None
-            high52 = safe_float(p1["High"].max()) if not p1.empty else None
-            low52 = safe_float(p1["Low"].min()) if not p1.empty else None
+            current = safe_float(p1["Close"].iloc[-1])
+            high52 = safe_float(p1["High"].max())
+            low52 = safe_float(p1["Low"].min())
 
             earn_rows = []
             df = past_earn.get(t, pd.DataFrame())
@@ -256,8 +246,7 @@ def fetch_all(tickers, progress):
                     "Next Earnings": next_earn.get(t),
                     **e
                 })
-        except Exception as ex:
-            st.warning(f"Error processing {t}: {str(ex)}")
+        except Exception:
             rows.append({"Ticker": t})
         progress.progress((i + 1) / len(tickers))
     return rows
@@ -265,109 +254,63 @@ def fetch_all(tickers, progress):
 # =========================
 # UI
 # =========================
-# Sidebar for inputs
-with st.sidebar:
-    st.header("Portfolio Input")
-    uploaded_files = st.file_uploader("Upload CSV or Excel files", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
-    tickers_text = st.text_area("Or enter tickers (one per line)", "AAPL\nMSFT\nNVDA\nGOOGL")
-    
-    st.divider()
-    st.markdown("**About Earnings Radar**")
-    st.markdown("Track upcoming earnings and historical reactions for your stocks. Built with Streamlit and yfinance.")
-    st.markdown("[GitHub Repo](https://github.com/Archiehehe/earnings)")
-
-# Main content
 st.title("📊 Earnings Radar")
-st.markdown("Upload your portfolio or enter tickers to view upcoming earnings calendars and historical market reactions.")
 
-# Collect tickers from both sources
+uploaded_files = st.file_uploader("Upload CSV or Excel files", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
+tickers_text = st.text_area("Enter tickers", "AAPL\nMSFT\nNVDA\nGOOGL")
+
 tickers = set()
-
-# Process uploaded files
 if uploaded_files:
-    st.info(f"📁 {len(uploaded_files)} file(s) uploaded")
     for f in uploaded_files:
         try:
-            # Read the file
-            if f.name.endswith(".csv"):
-                df = pd.read_csv(f)
-            else:
-                df = pd.read_excel(f)
-            
-            # Look for ticker column
-            ticker_found = False
-            for col in ["Ticker", "Symbol", "ticker", "symbol", "TICKER", "SYMBOL"]:
+            df = pd.read_csv(f) if f.name.endswith(".csv") else pd.read_excel(f)
+            for col in ["Ticker", "Symbol", "ticker", "symbol"]:
                 if col in df.columns:
-                    file_tickers = df[col].dropna().astype(str).str.strip().str.upper()
-                    tickers.update(file_tickers)
-                    st.success(f"✅ Found {len(file_tickers)} tickers in {f.name} (column: '{col}')")
-                    ticker_found = True
+                    tickers.update(df[col].dropna().astype(str).str.upper())
                     break
-            
-            if not ticker_found:
-                st.warning(f"⚠️ No ticker column found in {f.name}. Looking for columns: Ticker, Symbol, ticker, symbol")
-                st.info(f"Available columns: {', '.join(df.columns.tolist())}")
-                
-        except Exception as e:
-            st.error(f"❌ Could not read {f.name}: {str(e)}")
+        except: st.warning(f"Could not read {f.name}")
 
-# Process manual text input
-manual_tickers = [t.strip().upper() for t in tickers_text.replace(",", "\n").split() if t.strip()]
-if manual_tickers:
-    tickers.update(manual_tickers)
-
-# Convert to sorted list
+tickers.update(t.strip().upper() for t in tickers_text.replace(",", "\n").split() if t.strip())
 tickers = sorted(tickers)
 
-# Show what we found
-if tickers:
-    st.success(f"🎯 Total tickers loaded: {len(tickers)}")
-    with st.expander("View all tickers"):
-        st.write(", ".join(tickers))
-else:
-    st.warning("⚠️ No tickers loaded. Please upload a file or enter tickers manually.")
-
-# Fetch button
-if st.button("Fetch Earnings", type="primary", disabled=len(tickers)==0):
-    with st.spinner(f"Fetching data for {len(tickers)} ticker(s)... This may take a moment."):
+if st.button("Fetch Earnings"):
+    if not tickers:
+        st.warning("No tickers provided")
+    else:
         progress = st.progress(0.0)
         final_rows = fetch_all(tickers, progress)
         df_result = pd.DataFrame(final_rows)
         
-        # Sort by Ticker and Date descending
-        df_result = df_result.sort_values(["Ticker", "Date"], ascending=[True, False])
+        # --- APPLY PERCENTAGE FORMATTING ---
+        pct_cols = [
+            "Δ vs 52W High %", "Δ vs 52W Low %", 
+            "1D Reaction %", "3D Reaction %"
+        ]
         
-        # Column configs for better display
-        pct_cols = ["Δ vs 52W High %", "Δ vs 52W Low %", "1D Reaction %", "3D Reaction %"]
-        column_config = {col: st.column_config.NumberColumn(format="%.2f%%") for col in pct_cols}
-        column_config.update({
-            "Current Price": st.column_config.NumberColumn(format="$%.2f"),
-            "52W High": st.column_config.NumberColumn(format="$%.2f"),
-            "52W Low": st.column_config.NumberColumn(format="$%.2f"),
-            "EPS Actual": st.column_config.NumberColumn(format="%.4f"),
-            "EPS Est.": st.column_config.NumberColumn(format="%.4f"),
-            "Surprise": st.column_config.NumberColumn(format="%.4f"),
-            "Next Earnings": st.column_config.DateColumn(format="YYYY-MM-DD"),
-            "Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
-        })
-        
-        st.subheader("Earnings Report")
-        st.dataframe(df_result, hide_index=True, column_config=column_config)
-
-        # Export to Excel
-        st.divider()
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            df_result.to_excel(writer, index=False, sheet_name='Earnings_Report')
-        
-        st.download_button(
-            label="📥 Download Results as Excel",
-            data=buffer,
-            file_name=f"earnings_radar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="secondary"
+        # Use Streamlit's column config for clean number formatting
+        st.dataframe(
+            df_result, 
+            use_container_width=True,
+            column_config={
+                col: st.column_config.NumberColumn(format="%.2f%%") 
+                for col in pct_cols
+            }
         )
 
-# Footer
-st.divider()
-st.markdown("Powered by yfinance, Finnhub, and Streamlit. Data may have delays or inaccuracies – always verify with official sources.")
+        # --- EXPORT TO EXCEL ---
+        st.divider()
+        
+        # Create a buffer for the Excel file
+        buffer = io.BytesIO()
+        
+        # Use xlsxwriter to handle the Excel creation in memory
+        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+            df_result.to_excel(writer, index=False, sheet_name='Earnings_Report')
+            
+        # Download button appears after dataframe generation
+        st.download_button(
+            label="📥 Download Results as Excel",
+            data=buffer.getvalue(),
+            file_name=f"earnings_radar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
