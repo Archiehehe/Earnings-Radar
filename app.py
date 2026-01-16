@@ -6,12 +6,13 @@ import io
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
+import time  # Added for potential rate limit handling
 
 # =========================
 # CONFIG
 # =========================
 FINNHUB_API_KEY = st.secrets.get("FINNHUB_API_KEY", "")
-MAX_WORKERS = 8
+MAX_WORKERS = 4  # Reduced from 8 to help with rate limiting
 
 st.set_page_config(page_title="Earnings Radar", layout="wide", page_icon="📊")
 
@@ -133,6 +134,7 @@ def get_next_earnings(ticker):
         result = method(ticker)
         if result and is_future(result):
             return result
+        time.sleep(0.5)  # Small delay to avoid rate limits
     return "TBD"
 
 # =========================
@@ -155,14 +157,17 @@ def finnhub_past_earnings(ticker, limit=4):
 # =========================
 @st.cache_data(ttl=3600)
 def yf_prices(tickers, period):
-    return yf.download(
-        tickers=tickers,
-        period=period,
-        interval="1d",
-        group_by="ticker",
-        threads=True,
-        progress=False,
-    )
+    try:
+        return yf.download(
+            tickers=tickers,
+            period=period,
+            interval="1d",
+            group_by="ticker",
+            threads=True,
+            progress=False,
+        )
+    except Exception:
+        return pd.DataFrame()  # Return empty on failure
 
 def market_cap(ticker):
     try:
@@ -195,14 +200,19 @@ def fetch_all(tickers, progress):
     prices_1y = yf_prices(tickers, "1y")
     prices_2y = yf_prices(tickers, "2y")
 
-    with ThreadPoolExecutor(MAX_WORKERS) as ex:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         mcaps = dict(zip(tickers, ex.map(market_cap, tickers)))
 
-    with ThreadPoolExecutor(MAX_WORKERS) as ex:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = {ex.submit(get_next_earnings, t): t for t in tickers}
-        next_earn = {futures[f]: f.result() for f in as_completed(futures)}
+        next_earn = {}
+        for f in as_completed(futures):
+            try:
+                next_earn[futures[f]] = f.result()
+            except Exception:
+                next_earn[futures[f]] = "TBD"
 
-    with ThreadPoolExecutor(MAX_WORKERS) as ex:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = {ex.submit(finnhub_past_earnings, t): t for t in tickers}
         past_earn = {futures[f]: f.result() for f in as_completed(futures)}
 
@@ -211,9 +221,9 @@ def fetch_all(tickers, progress):
             p1 = prices_1y[t] if len(tickers) > 1 else prices_1y
             p2 = prices_2y[t] if len(tickers) > 1 else prices_2y
 
-            current = safe_float(p1["Close"].iloc[-1])
-            high52 = safe_float(p1["High"].max())
-            low52 = safe_float(p1["Low"].min())
+            current = safe_float(p1["Close"].iloc[-1]) if not p1.empty else None
+            high52 = safe_float(p1["High"].max()) if not p1.empty else None
+            low52 = safe_float(p1["Low"].min()) if not p1.empty else None
 
             earn_rows = []
             df = past_earn.get(t, pd.DataFrame())
@@ -246,13 +256,14 @@ def fetch_all(tickers, progress):
                     "Next Earnings": next_earn.get(t),
                     **e
                 })
-        except Exception:
+        except Exception as ex:
+            st.warning(f"Error processing {t}: {str(ex)}")
             rows.append({"Ticker": t})
         progress.progress((i + 1) / len(tickers))
     return rows
 
 # =========================
-# UI IMPROVEMENTS
+# UI
 # =========================
 # Sidebar for inputs
 with st.sidebar:
@@ -331,7 +342,7 @@ if st.button("Fetch Earnings", type="primary"):
             # Create a buffer for the Excel file
             buffer = io.BytesIO()
             
-            # Use openpyxl instead of xlsxwriter to avoid ModuleNotFoundError
+            # Use openpyxl to avoid ModuleNotFoundError
             with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                 df_result.to_excel(writer, index=False, sheet_name='Earnings_Report')
             
