@@ -6,84 +6,15 @@ import io
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
-import time  # For rate limit handling
+import time
 
 # =========================
 # CONFIG
 # =========================
-FINNHUB_API_KEY = st.secrets.get("FINNHUB_API_KEY", "d54rt91r01qojbih3rd0d54rt91r01qojbih3rdg")
-MAX_WORKERS = 4  # Reduced to avoid rate limits
+FINNHUB_API_KEY = st.secrets.get("FINNHUB_API_KEY", "")
+MAX_WORKERS = 4
 
-st.set_page_config(page_title="Earnings Radar", layout="wide", page_icon="📊", initial_sidebar_state="collapsed")
-
-# Custom CSS for SpaceX/Cybertruck/Elon vibe: Dark theme, futuristic fonts, minimalistic
-custom_css = """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&display=swap');
-@import url('https://fonts.googleapis.com/css2?family=Roboto+Mono&display=swap');
-
-body {
-    background-color: #000000;
-    color: #FFFFFF;
-}
-.stApp {
-    background-color: #000000;
-}
-h1 {
-    font-family: 'Orbitron', sans-serif;
-    font-size: 4rem;
-    text-align: center;
-    color: #FFFFFF;
-    text-shadow: 0 0 10px rgba(255, 255, 255, 0.5);
-}
-h2, h3 {
-    font-family: 'Orbitron', sans-serif;
-    color: #FFFFFF;
-}
-p, div, span, label {
-    font-family: 'Roboto Mono', monospace;
-    color: #DDDDDD;
-}
-.stTextInput > div > div > input {
-    background-color: #1A1A1A;
-    color: #FFFFFF;
-    border: 1px solid #333333;
-    border-radius: 5px;
-    padding: 10px;
-    font-family: 'Roboto Mono', monospace;
-}
-.stButton > button {
-    background-color: #FF0000;  /* Red like Cybertruck accents */
-    color: #FFFFFF;
-    border: none;
-    border-radius: 5px;
-    font-family: 'Orbitron', sans-serif;
-    font-weight: bold;
-    padding: 10px 20px;
-    transition: all 0.3s ease;
-}
-.stButton > button:hover {
-    background-color: #CC0000;
-    box-shadow: 0 0 15px rgba(255, 0, 0, 0.7);
-}
-.stDataFrame {
-    background-color: #0A0A0A;
-    color: #FFFFFF;
-}
-.stProgress > div > div > div > div {
-    background-color: #FF0000;
-}
-.footer {
-    text-align: center;
-    font-size: 0.8rem;
-    color: #888888;
-    position: fixed;
-    bottom: 10px;
-    width: 100%;
-}
-</style>
-"""
-st.markdown(custom_css, unsafe_allow_html=True)
+st.set_page_config(page_title="Earnings Radar", layout="wide", page_icon="📊")
 
 # =========================
 # HELPERS
@@ -100,11 +31,13 @@ def pct(a, b):
     return (a - b) / b * 100
 
 def is_future(date_obj):
+    """Check if a date is today or in the future"""
     if date_obj is None:
         return False
     return date_obj >= datetime.now().date()
 
 def format_market_cap(val):
+    """Truncate large market cap numbers to M, B, or T"""
     if val is None or not isinstance(val, (int, float)):
         return "N/A"
     if val >= 1e12:
@@ -116,9 +49,10 @@ def format_market_cap(val):
     return f"{val:.2f}"
 
 # =========================
-# NEXT EARNINGS
+# NEXT EARNINGS (MULTIPLE METHODS)
 # =========================
 def get_next_earnings_yahoo_scrape(ticker):
+    """Scrape next earnings from Yahoo Finance page"""
     try:
         url = f"https://finance.yahoo.com/quote/{ticker}"
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -138,6 +72,7 @@ def get_next_earnings_yahoo_scrape(ticker):
     return None
 
 def get_next_earnings_yf_info(ticker):
+    """Try yfinance info method"""
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
@@ -152,6 +87,7 @@ def get_next_earnings_yf_info(ticker):
     return None
 
 def get_next_earnings_yf_calendar(ticker):
+    """Try yfinance calendar"""
     try:
         stock = yf.Ticker(ticker)
         cal = stock.calendar
@@ -172,6 +108,7 @@ def get_next_earnings_yf_calendar(ticker):
     return None
 
 def get_next_earnings_fmp(ticker):
+    """Try Financial Modeling Prep API"""
     try:
         url = f"https://financialmodelingprep.com/api/v3/earning_calendar?symbol={ticker}"
         response = requests.get(url, timeout=10)
@@ -185,6 +122,7 @@ def get_next_earnings_fmp(ticker):
     return None
 
 def get_next_earnings(ticker):
+    """Try multiple methods and force a future date"""
     methods = [
         get_next_earnings_yf_calendar,
         get_next_earnings_yf_info,
@@ -200,7 +138,7 @@ def get_next_earnings(ticker):
     return "TBD"
 
 # =========================
-# FINNHUB PAST EARNINGS
+# FINNHUB (PAST EARNINGS)
 # =========================
 def finnhub_past_earnings(ticker, limit=4):
     try:
@@ -215,7 +153,7 @@ def finnhub_past_earnings(ticker, limit=4):
     return pd.DataFrame()
 
 # =========================
-# YFINANCE
+# YFINANCE (CACHED)
 # =========================
 @st.cache_data(ttl=3600)
 def yf_prices(tickers, period):
@@ -325,75 +263,111 @@ def fetch_all(tickers, progress):
     return rows
 
 # =========================
-# UI - Futuristic Layout
+# UI
 # =========================
-st.title("EARNINGS RADAR")
-st.markdown("<p style='text-align: center; font-size: 1.2rem;'>Market Intelligence Engine</p>", unsafe_allow_html=True)
+# Sidebar for inputs
+with st.sidebar:
+    st.header("Portfolio Input")
+    uploaded_files = st.file_uploader("Upload CSV or Excel files", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
+    tickers_text = st.text_area("Or enter tickers (one per line)", "AAPL\nMSFT\nNVDA\nGOOGL")
+    
+    st.divider()
+    st.markdown("**About Earnings Radar**")
+    st.markdown("Track upcoming earnings and historical reactions for your stocks. Built with Streamlit and yfinance.")
+    st.markdown("[GitHub Repo](https://github.com/Archiehehe/earnings)")
 
-# Center the input
-col1, col2, col3 = st.columns([1, 2, 1])
-with col2:
-    tickers_text = st.text_input("Enter tickers (comma-separated)", "AAPL,MSFT,NVDA,GOOGL")
-    uploaded_files = st.file_uploader("Or upload CSV/Excel portfolio", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
+# Main content
+st.title("📊 Earnings Radar")
+st.markdown("Upload your portfolio or enter tickers to view upcoming earnings calendars and historical market reactions.")
 
+# Collect tickers from both sources
 tickers = set()
+
+# Process uploaded files
 if uploaded_files:
+    st.info(f"📁 {len(uploaded_files)} file(s) uploaded")
     for f in uploaded_files:
         try:
-            df = pd.read_csv(f) if f.name.endswith(".csv") else pd.read_excel(f)
-            for col in ["Ticker", "Symbol", "ticker", "symbol"]:
+            # Read the file
+            if f.name.endswith(".csv"):
+                df = pd.read_csv(f)
+            else:
+                df = pd.read_excel(f)
+            
+            # Look for ticker column
+            ticker_found = False
+            for col in ["Ticker", "Symbol", "ticker", "symbol", "TICKER", "SYMBOL"]:
                 if col in df.columns:
-                    tickers.update(df[col].dropna().astype(str).str.upper())
+                    file_tickers = df[col].dropna().astype(str).str.strip().str.upper()
+                    tickers.update(file_tickers)
+                    st.success(f"✅ Found {len(file_tickers)} tickers in {f.name} (column: '{col}')")
+                    ticker_found = True
                     break
-        except:
-            st.warning(f"Could not read {f.name}")
+            
+            if not ticker_found:
+                st.warning(f"⚠️ No ticker column found in {f.name}. Looking for columns: Ticker, Symbol, ticker, symbol")
+                st.info(f"Available columns: {', '.join(df.columns.tolist())}")
+                
+        except Exception as e:
+            st.error(f"❌ Could not read {f.name}: {str(e)}")
 
-if tickers_text:
-    tickers.update(t.strip().upper() for t in tickers_text.split(",") if t.strip())
+# Process manual text input
+manual_tickers = [t.strip().upper() for t in tickers_text.replace(",", "\n").split() if t.strip()]
+if manual_tickers:
+    tickers.update(manual_tickers)
+
+# Convert to sorted list
 tickers = sorted(tickers)
 
-col1, col2, col3 = st.columns([1, 1, 1])
-with col2:
-    if st.button("LAUNCH RADAR", type="primary"):
-        if not tickers:
-            st.warning("No tickers provided")
-        else:
-            with st.spinner("Scanning markets..."):
-                progress = st.progress(0)
-                final_rows = fetch_all(tickers, progress)
-                df_result = pd.DataFrame(final_rows)
-                
-                # Sort
-                df_result = df_result.sort_values(["Ticker", "Date"], ascending=[True, False])
-                
-                # Column configs
-                pct_cols = ["Δ vs 52W High %", "Δ vs 52W Low %", "1D Reaction %", "3D Reaction %"]
-                column_config = {col: st.column_config.NumberColumn(format="%.2f%%") for col in pct_cols}
-                column_config.update({
-                    "Current Price": st.column_config.NumberColumn(format="$%.2f"),
-                    "52W High": st.column_config.NumberColumn(format="$%.2f"),
-                    "52W Low": st.column_config.NumberColumn(format="$%.2f"),
-                    "EPS Actual": st.column_config.NumberColumn(format="%.4f"),
-                    "EPS Est.": st.column_config.NumberColumn(format="%.4f"),
-                    "Surprise": st.column_config.NumberColumn(format="%.4f"),
-                    "Next Earnings": st.column_config.DateColumn(format="YYYY-MM-DD"),
-                    "Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
-                })
-                
-                st.subheader("RADAR SCAN RESULTS")
-                st.dataframe(df_result, hide_index=True, column_config=column_config)
-                
-                # Export
-                buffer = io.BytesIO()
-                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                    df_result.to_excel(writer, index=False, sheet_name='Earnings_Report')
-                
-                st.download_button(
-                    label="DOWNLOAD SCAN",
-                    data=buffer,
-                    file_name=f"earnings_radar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+# Show what we found
+if tickers:
+    st.success(f"🎯 Total tickers loaded: {len(tickers)}")
+    with st.expander("View all tickers"):
+        st.write(", ".join(tickers))
+else:
+    st.warning("⚠️ No tickers loaded. Please upload a file or enter tickers manually.")
+
+# Fetch button
+if st.button("Fetch Earnings", type="primary", disabled=len(tickers)==0):
+    with st.spinner(f"Fetching data for {len(tickers)} ticker(s)... This may take a moment."):
+        progress = st.progress(0.0)
+        final_rows = fetch_all(tickers, progress)
+        df_result = pd.DataFrame(final_rows)
+        
+        # Sort by Ticker and Date descending
+        df_result = df_result.sort_values(["Ticker", "Date"], ascending=[True, False])
+        
+        # Column configs for better display
+        pct_cols = ["Δ vs 52W High %", "Δ vs 52W Low %", "1D Reaction %", "3D Reaction %"]
+        column_config = {col: st.column_config.NumberColumn(format="%.2f%%") for col in pct_cols}
+        column_config.update({
+            "Current Price": st.column_config.NumberColumn(format="$%.2f"),
+            "52W High": st.column_config.NumberColumn(format="$%.2f"),
+            "52W Low": st.column_config.NumberColumn(format="$%.2f"),
+            "EPS Actual": st.column_config.NumberColumn(format="%.4f"),
+            "EPS Est.": st.column_config.NumberColumn(format="%.4f"),
+            "Surprise": st.column_config.NumberColumn(format="%.4f"),
+            "Next Earnings": st.column_config.DateColumn(format="YYYY-MM-DD"),
+            "Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
+        })
+        
+        st.subheader("Earnings Report")
+        st.dataframe(df_result, hide_index=True, column_config=column_config)
+
+        # Export to Excel
+        st.divider()
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+            df_result.to_excel(writer, index=False, sheet_name='Earnings_Report')
+        
+        st.download_button(
+            label="📥 Download Results as Excel",
+            data=buffer,
+            file_name=f"earnings_radar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="secondary"
+        )
 
 # Footer
-st.markdown("<div class='footer'>Powered by yfinance & Finnhub · Not financial advice</div>", unsafe_allow_html=True)
+st.divider()
+st.markdown("Powered by yfinance, Finnhub, and Streamlit. Data may have delays or inaccuracies – always verify with official sources.")
